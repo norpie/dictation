@@ -1,6 +1,6 @@
 use anyhow::Result;
 use log::{info, error, debug};
-use shared::{Config, ClientMessage, DaemonMessage, DaemonStatus, TranscriptionSession};
+use shared::{Config, ClientMessage, DaemonMessage, DaemonStatus, TranscriptionSession, AudioChunk};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, Instant};
@@ -9,10 +9,47 @@ use uuid::Uuid;
 
 use crate::whisper::WhisperManager;
 
+pub struct AudioBuffer {
+    data: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+    last_chunk_time: SystemTime,
+}
+
+impl AudioBuffer {
+    fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            sample_rate: 16000,
+            channels: 1,
+            last_chunk_time: SystemTime::now(),
+        }
+    }
+    
+    fn append_chunk(&mut self, chunk: &AudioChunk) {
+        self.data.extend_from_slice(&chunk.data);
+        self.sample_rate = chunk.sample_rate;
+        self.channels = chunk.channels;
+        self.last_chunk_time = chunk.timestamp;
+    }
+    
+    fn duration_seconds(&self) -> f32 {
+        if self.sample_rate == 0 || self.channels == 0 {
+            return 0.0;
+        }
+        self.data.len() as f32 / (self.sample_rate * self.channels as u32) as f32
+    }
+    
+    fn is_silent_timeout(&self, timeout_seconds: f32) -> bool {
+        self.last_chunk_time.elapsed().unwrap_or_default().as_secs_f32() > timeout_seconds
+    }
+}
+
 pub struct Daemon {
     config: Config,
     whisper_manager: Arc<RwLock<WhisperManager>>,
     active_sessions: Arc<RwLock<HashMap<Uuid, TranscriptionSession>>>,
+    audio_buffers: Arc<RwLock<HashMap<Uuid, AudioBuffer>>>,
     start_time: Instant,
 }
 
@@ -24,6 +61,7 @@ impl Daemon {
             config,
             whisper_manager,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            audio_buffers: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
         })
     }
@@ -57,10 +95,14 @@ impl Daemon {
         let session = TranscriptionSession::new();
         let session_id = session.id;
         
-        // Store the session
+        // Store the session and create audio buffer
         {
             let mut sessions = self.active_sessions.write().await;
             sessions.insert(session_id, session);
+        }
+        {
+            let mut buffers = self.audio_buffers.write().await;
+            buffers.insert(session_id, AudioBuffer::new());
         }
         
         // Ensure whisper model is loaded
@@ -78,18 +120,53 @@ impl Daemon {
     async fn stop_recording(&self) -> DaemonMessage {
         info!("Stopping recording sessions");
         
-        // For now, just clear all active sessions
-        // In the future, we'll want to finalize transcription
-        {
+        // Process any remaining audio in buffers before stopping
+        let final_transcriptions = {
+            let mut buffers = self.audio_buffers.write().await;
             let mut sessions = self.active_sessions.write().await;
+            let mut results = Vec::new();
+            
+            for (session_id, buffer) in buffers.drain() {
+                if !buffer.data.is_empty() {
+                    info!("Processing final audio for session {}: {:.1}s of audio", 
+                        session_id, buffer.duration_seconds());
+                    
+                    // Transcribe the final audio
+                    let mut whisper = self.whisper_manager.write().await;
+                    match whisper.transcribe_audio(&buffer.data).await {
+                        Ok(transcription) => {
+                            if let Some(session) = sessions.get_mut(&session_id) {
+                                session.text = transcription.clone();
+                                session.status = shared::SessionStatus::Completed;
+                                results.push(session.clone());
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to transcribe final audio for session {}: {}", session_id, e);
+                            if let Some(session) = sessions.get_mut(&session_id) {
+                                session.status = shared::SessionStatus::Failed(e.to_string());
+                                results.push(session.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            
             sessions.clear();
-        }
+            results
+        };
         
-        DaemonMessage::RecordingStopped
+        // Return the final transcription if there's one session, otherwise just stopped
+        if let Some(session) = final_transcriptions.into_iter().next() {
+            DaemonMessage::TranscriptionComplete(session)
+        } else {
+            DaemonMessage::RecordingStopped
+        }
     }
     
-    async fn handle_audio_chunk(&self, audio_chunk: shared::AudioChunk) -> DaemonMessage {
-        debug!("Received audio chunk for session {}", audio_chunk.session_id);
+    async fn handle_audio_chunk(&self, audio_chunk: AudioChunk) -> DaemonMessage {
+        debug!("Received audio chunk for session {} with {} samples", 
+            audio_chunk.session_id, audio_chunk.data.len());
         
         // Check if session exists
         let session_exists = {
@@ -101,11 +178,97 @@ impl Daemon {
             return DaemonMessage::Error("Session not found".to_string());
         }
         
-        // TODO: Process audio chunk with Whisper
-        // For now, just acknowledge receipt
-        DaemonMessage::TranscriptionUpdate {
-            session_id: audio_chunk.session_id,
-            partial_text: "[Audio received - transcription not yet implemented]".to_string(),
+        // Add audio to buffer
+        let should_transcribe = {
+            let mut buffers = self.audio_buffers.write().await;
+            if let Some(buffer) = buffers.get_mut(&audio_chunk.session_id) {
+                buffer.append_chunk(&audio_chunk);
+                
+                // Transcribe when we have enough audio (3+ seconds) or every few chunks
+                let duration = buffer.duration_seconds();
+                debug!("Buffer now has {:.1}s of audio", duration);
+                
+                duration >= 3.0 // Transcribe every 3 seconds of audio
+            } else {
+                error!("Audio buffer not found for session {}", audio_chunk.session_id);
+                false
+            }
+        };
+        
+        if should_transcribe {
+            // Get a copy of the audio data for transcription
+            let audio_data = {
+                let buffers = self.audio_buffers.read().await;
+                buffers.get(&audio_chunk.session_id)
+                    .map(|buffer| buffer.data.clone())
+                    .unwrap_or_default()
+            };
+            
+            if !audio_data.is_empty() {
+                info!("Transcribing {:.1}s of audio for session {}", 
+                    audio_data.len() as f32 / 16000.0, audio_chunk.session_id);
+                
+                // Transcribe the audio
+                let mut whisper = self.whisper_manager.write().await;
+                match whisper.transcribe_audio(&audio_data).await {
+                    Ok(transcription) => {
+                        info!("Transcription result: '{}'", transcription);
+                        
+                        // Update session with transcription
+                        {
+                            let mut sessions = self.active_sessions.write().await;
+                            if let Some(session) = sessions.get_mut(&audio_chunk.session_id) {
+                                if !transcription.is_empty() && !transcription.contains("[No speech detected]") {
+                                    // Append to existing text with space if needed
+                                    if !session.text.is_empty() {
+                                        session.text.push(' ');
+                                    }
+                                    session.text.push_str(&transcription);
+                                    session.status = shared::SessionStatus::Processing;
+                                }
+                            }
+                        }
+                        
+                        // Clear the buffer after successful transcription
+                        {
+                            let mut buffers = self.audio_buffers.write().await;
+                            if let Some(buffer) = buffers.get_mut(&audio_chunk.session_id) {
+                                buffer.data.clear();
+                            }
+                        }
+                        
+                        // Return transcription update
+                        if !transcription.is_empty() && !transcription.contains("[No speech detected]") {
+                            DaemonMessage::TranscriptionUpdate {
+                                session_id: audio_chunk.session_id,
+                                partial_text: transcription,
+                            }
+                        } else {
+                            // No speech detected, just acknowledge
+                            DaemonMessage::TranscriptionUpdate {
+                                session_id: audio_chunk.session_id,
+                                partial_text: "".to_string(),
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Transcription failed for session {}: {}", audio_chunk.session_id, e);
+                        DaemonMessage::Error(format!("Transcription failed: {}", e))
+                    }
+                }
+            } else {
+                // No audio data to transcribe
+                DaemonMessage::TranscriptionUpdate {
+                    session_id: audio_chunk.session_id,
+                    partial_text: "".to_string(),
+                }
+            }
+        } else {
+            // Just acknowledge receipt, not ready to transcribe yet
+            DaemonMessage::TranscriptionUpdate {
+                session_id: audio_chunk.session_id,
+                partial_text: "".to_string(),
+            }
         }
     }
     

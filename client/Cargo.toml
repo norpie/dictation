@@ -13,3 +13,4 @@ log = { workspace = true }
 env_logger = { workspace = true }
 nix = { workspace = true }
 cpal = { workspace = true }
+uuid = { workspace = true }
