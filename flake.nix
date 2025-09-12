@@ -76,7 +76,8 @@
               export PKG_CONFIG_PATH="${pipewire.dev}/lib/pkgconfig:${alsa-lib.dev}/lib/pkgconfig:${gtk4.dev}/lib/pkgconfig:${libadwaita.dev}/lib/pkgconfig:${dbus.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
               export WHISPER_CPP_LIB_DIR="${whisper-cpp}/lib"
               export WHISPER_CPP_INCLUDE_DIR="${whisper-cpp}/include"
-              export LIBCLANG_PATH="${clang.cc}/lib"
+              export LIBCLANG_PATH="${pkgs.llvmPackages_latest.libclang.lib}/lib"
+              export WHISPER_DONT_GENERATE_BINDINGS=1
               echo "Dictation development environment ready!"
             '';
           };

@@ -1,18 +1,14 @@
-use anyhow::{Result, Context};
-use log::{info, warn, error};
+use anyhow::Result;
+use log::{info, error};
 use shared::WhisperConfig;
 use std::time::{SystemTime, Duration};
+use std::sync::Arc;
+use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 
 pub struct WhisperManager {
     config: WhisperConfig,
-    model: Option<WhisperModel>,
+    model: Option<Arc<WhisperContext>>,
     last_used: Option<SystemTime>,
-}
-
-struct WhisperModel {
-    // Placeholder for whisper-rs integration
-    // Will be implemented when we add full Whisper support
-    _placeholder: (),
 }
 
 impl WhisperManager {
@@ -47,14 +43,16 @@ impl WhisperManager {
             ));
         }
         
-        // TODO: Actually load the whisper model using whisper-rs
-        // For now, just create a placeholder
-        info!("Model loading simulation (placeholder implementation)");
-        tokio::time::sleep(Duration::from_millis(500)).await; // Simulate loading time
+        info!("Loading Whisper model from {:?}", self.config.model_path);
         
-        self.model = Some(WhisperModel {
-            _placeholder: (),
-        });
+        // Load the model using whisper-rs in a blocking task
+        let model_path = self.config.model_path.clone();
+        let ctx = tokio::task::spawn_blocking(move || {
+            let params = WhisperContextParameters::default();
+            WhisperContext::new_with_params(&model_path.to_string_lossy(), params)
+        }).await??;
+        
+        self.model = Some(Arc::new(ctx));
         
         info!("Whisper model loaded successfully");
         Ok(())
@@ -74,15 +72,72 @@ impl WhisperManager {
         Ok(())
     }
     
-    pub async fn transcribe_audio(&mut self, _audio_data: &[f32]) -> Result<String> {
-        if self.model.is_none() {
-            return Err(anyhow::anyhow!("Whisper model not loaded"));
-        }
+    pub async fn transcribe_audio(&mut self, audio_data: &[f32]) -> Result<String> {
+        let ctx = self.model.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Whisper model not loaded"))?;
         
-        // TODO: Implement actual transcription
-        // For now, return placeholder text
+        // Clone data needed for the blocking task
+        let ctx_clone = Arc::clone(ctx);
+        let audio_data = audio_data.to_vec();
+        let language = self.config.language.clone();
+        
+        // Run transcription in a blocking task since whisper-rs is sync
+        let transcription_result = Self::transcribe_blocking(ctx_clone, audio_data, language).await?;
+        
+        // Update last used time after transcription
         self.last_used = Some(SystemTime::now());
         
-        Ok("[Transcription placeholder - not yet implemented]".to_string())
+        match transcription_result {
+            Ok(transcription) => {
+                if transcription.trim().is_empty() {
+                    Ok("[No speech detected]".to_string())
+                } else {
+                    Ok(transcription.trim().to_string())
+                }
+            }
+            Err(e) => {
+                error!("Transcription failed: {:?}", e);
+                Err(anyhow::anyhow!("Transcription failed: {:?}", e))
+            }
+        }
+    }
+    
+    async fn transcribe_blocking(
+        ctx: Arc<WhisperContext>,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+    ) -> Result<Result<String, whisper_rs::WhisperError>> {
+        tokio::task::spawn_blocking(move || {
+            // Create a state from the context
+            let mut state = ctx.create_state()?;
+            
+            // Create parameters for transcription
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            
+            // Set language if specified
+            if let Some(ref lang) = language {
+                params.set_language(Some(lang));
+            }
+            
+            // Set other parameters based on config
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            
+            // Run the transcription
+            state.full(params, &audio_data)?;
+            
+            // Get the transcribed text
+            let num_segments = state.full_n_segments()?;
+            let mut transcription = String::new();
+            
+            for i in 0..num_segments {
+                let segment_text = state.full_get_segment_text(i)?;
+                transcription.push_str(&segment_text);
+            }
+            
+            Ok(transcription)
+        }).await.map_err(|e| anyhow::anyhow!("Task failed: {}", e))
     }
 }
