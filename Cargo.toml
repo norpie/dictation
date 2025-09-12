@@ -31,7 +31,7 @@ gtk4 = "0.7"
 libadwaita = "0.5"
 
 # Whisper integration
-whisper-rs = "0.10"
+whisper-rs = "0.15.1"
 
 # System directories
 dirs = "5.0"

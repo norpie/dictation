@@ -32,6 +32,9 @@
             dbus
             systemd
             whisper-cpp
+            rocmPackages.clr
+            rocmPackages.rocblas  
+            rocmPackages.hipblas
           ];
       in {
         devShells.default = with pkgs;
@@ -62,6 +65,12 @@
               # Whisper dependencies
               whisper-cpp
               
+              # ROCm dependencies for AMD GPU acceleration
+              rocmPackages.clr
+              rocmPackages.rocblas  
+              rocmPackages.hipblas
+              rocmPackages.rocminfo
+              
               # Wayland tools
               wl-clipboard
               libnotify
@@ -78,7 +87,14 @@
               export WHISPER_CPP_INCLUDE_DIR="${whisper-cpp}/include"
               export LIBCLANG_PATH="${pkgs.llvmPackages_latest.libclang.lib}/lib"
               export WHISPER_DONT_GENERATE_BINDINGS=1
-              echo "Dictation development environment ready!"
+              
+              # ROCm configuration for AMD RX 7900 XTX
+              export HSA_OVERRIDE_GFX_VERSION=11.0.0
+              export AMDGPU_TARGETS=gfx1100
+              export HIP_PATH="${rocmPackages.clr}"
+              export PATH="${rocmPackages.clr}/bin:$PATH"
+              
+              echo "Dictation development environment ready with ROCm GPU support!"
             '';
           };
           

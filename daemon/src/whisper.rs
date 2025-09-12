@@ -119,22 +119,34 @@ impl WhisperManager {
                 params.set_language(Some(lang));
             }
             
-            // Set other parameters based on config
+            // Set parameters for full transcription (not streaming)
+            params.set_single_segment(false); // Allow multiple segments for better transcription
             params.set_print_special(false);
             params.set_print_progress(false);
             params.set_print_realtime(false);
             params.set_print_timestamps(false);
             
+            // Disable suppression tokens to avoid [MUSIC] and other special tokens
+            params.set_suppress_nst(true);
+            params.set_suppress_blank(true);
+            
+            // Better speech detection for full audio
+            params.set_no_speech_thold(0.6); // Lower threshold for better speech detection on full audio
+            params.set_logprob_thold(-1.0);  // Default log probability threshold
+            
             // Run the transcription
             state.full(params, &audio_data)?;
             
             // Get the transcribed text
-            let num_segments = state.full_n_segments()?;
+            let num_segments = state.full_n_segments();
             let mut transcription = String::new();
             
             for i in 0..num_segments {
-                let segment_text = state.full_get_segment_text(i)?;
-                transcription.push_str(&segment_text);
+                if let Some(segment) = state.get_segment(i) {
+                    if let Ok(text) = segment.to_str() {
+                        transcription.push_str(text);
+                    }
+                }
             }
             
             Ok(transcription)

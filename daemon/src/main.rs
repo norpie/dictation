@@ -1,11 +1,9 @@
 use anyhow::Result;
 use log::{info, error, warn};
-use shared::{Config, ClientMessage, DaemonMessage, protocol};
+use shared::{Config, ClientMessage, protocol};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::fs;
 use std::sync::Arc;
-use std::collections::HashMap;
-use uuid::Uuid;
 
 mod daemon;
 mod whisper;

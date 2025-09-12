@@ -43,6 +43,11 @@ impl AudioBuffer {
     fn is_silent_timeout(&self, timeout_seconds: f32) -> bool {
         self.last_chunk_time.elapsed().unwrap_or_default().as_secs_f32() > timeout_seconds
     }
+    
+    fn get_all_audio(&self) -> Vec<f32> {
+        // Return all audio data for final transcription
+        self.data.clone()
+    }
 }
 
 pub struct Daemon {
@@ -132,8 +137,9 @@ impl Daemon {
                         session_id, buffer.duration_seconds());
                     
                     // Transcribe the final audio
+                    let audio_data = buffer.get_all_audio();
                     let mut whisper = self.whisper_manager.write().await;
-                    match whisper.transcribe_audio(&buffer.data).await {
+                    match whisper.transcribe_audio(&audio_data).await {
                         Ok(transcription) => {
                             if let Some(session) = sessions.get_mut(&session_id) {
                                 session.text = transcription.clone();
@@ -178,97 +184,22 @@ impl Daemon {
             return DaemonMessage::Error("Session not found".to_string());
         }
         
-        // Add audio to buffer
-        let should_transcribe = {
+        // Just add audio to buffer - no transcription during streaming
+        {
             let mut buffers = self.audio_buffers.write().await;
             if let Some(buffer) = buffers.get_mut(&audio_chunk.session_id) {
                 buffer.append_chunk(&audio_chunk);
-                
-                // Transcribe when we have enough audio (3+ seconds) or every few chunks
-                let duration = buffer.duration_seconds();
-                debug!("Buffer now has {:.1}s of audio", duration);
-                
-                duration >= 3.0 // Transcribe every 3 seconds of audio
+                debug!("Buffer now has {:.1}s of audio", buffer.duration_seconds());
             } else {
                 error!("Audio buffer not found for session {}", audio_chunk.session_id);
-                false
+                return DaemonMessage::Error("Audio buffer not found".to_string());
             }
-        };
+        }
         
-        if should_transcribe {
-            // Get a copy of the audio data for transcription
-            let audio_data = {
-                let buffers = self.audio_buffers.read().await;
-                buffers.get(&audio_chunk.session_id)
-                    .map(|buffer| buffer.data.clone())
-                    .unwrap_or_default()
-            };
-            
-            if !audio_data.is_empty() {
-                info!("Transcribing {:.1}s of audio for session {}", 
-                    audio_data.len() as f32 / 16000.0, audio_chunk.session_id);
-                
-                // Transcribe the audio
-                let mut whisper = self.whisper_manager.write().await;
-                match whisper.transcribe_audio(&audio_data).await {
-                    Ok(transcription) => {
-                        info!("Transcription result: '{}'", transcription);
-                        
-                        // Update session with transcription
-                        {
-                            let mut sessions = self.active_sessions.write().await;
-                            if let Some(session) = sessions.get_mut(&audio_chunk.session_id) {
-                                if !transcription.is_empty() && !transcription.contains("[No speech detected]") {
-                                    // Append to existing text with space if needed
-                                    if !session.text.is_empty() {
-                                        session.text.push(' ');
-                                    }
-                                    session.text.push_str(&transcription);
-                                    session.status = shared::SessionStatus::Processing;
-                                }
-                            }
-                        }
-                        
-                        // Clear the buffer after successful transcription
-                        {
-                            let mut buffers = self.audio_buffers.write().await;
-                            if let Some(buffer) = buffers.get_mut(&audio_chunk.session_id) {
-                                buffer.data.clear();
-                            }
-                        }
-                        
-                        // Return transcription update
-                        if !transcription.is_empty() && !transcription.contains("[No speech detected]") {
-                            DaemonMessage::TranscriptionUpdate {
-                                session_id: audio_chunk.session_id,
-                                partial_text: transcription,
-                            }
-                        } else {
-                            // No speech detected, just acknowledge
-                            DaemonMessage::TranscriptionUpdate {
-                                session_id: audio_chunk.session_id,
-                                partial_text: "".to_string(),
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Transcription failed for session {}: {}", audio_chunk.session_id, e);
-                        DaemonMessage::Error(format!("Transcription failed: {}", e))
-                    }
-                }
-            } else {
-                // No audio data to transcribe
-                DaemonMessage::TranscriptionUpdate {
-                    session_id: audio_chunk.session_id,
-                    partial_text: "".to_string(),
-                }
-            }
-        } else {
-            // Just acknowledge receipt, not ready to transcribe yet
-            DaemonMessage::TranscriptionUpdate {
-                session_id: audio_chunk.session_id,
-                partial_text: "".to_string(),
-            }
+        // Just acknowledge receipt
+        DaemonMessage::TranscriptionUpdate {
+            session_id: audio_chunk.session_id,
+            partial_text: "".to_string(),
         }
     }
     
