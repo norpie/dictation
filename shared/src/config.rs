@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -70,14 +71,50 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn config_dir() -> Result<PathBuf> {
+        let config_dir = dirs::config_dir()
+            .context("Failed to get config directory")?
+            .join("dictation");
+        
+        if !config_dir.exists() {
+            fs::create_dir_all(&config_dir)
+                .context("Failed to create config directory")?;
+        }
+        
+        Ok(config_dir)
+    }
+    
+    pub fn config_file() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("config.yaml"))
+    }
+    
     pub fn load() -> Result<Self> {
-        // TODO: Load from XDG config directory
-        // For now, return default config
-        Ok(Self::default())
+        let config_file = Self::config_file()?;
+        
+        if config_file.exists() {
+            let content = fs::read_to_string(&config_file)
+                .with_context(|| format!("Failed to read config file: {}", config_file.display()))?;
+            
+            let config: Config = serde_yaml::from_str(&content)
+                .with_context(|| format!("Failed to parse config file: {}", config_file.display()))?;
+                
+            Ok(config)
+        } else {
+            // Create default config file
+            let default_config = Self::default();
+            default_config.save()?;
+            Ok(default_config)
+        }
     }
     
     pub fn save(&self) -> Result<()> {
-        // TODO: Save to XDG config directory
+        let config_file = Self::config_file()?;
+        let content = serde_yaml::to_string(self)
+            .context("Failed to serialize config")?;
+            
+        fs::write(&config_file, content)
+            .with_context(|| format!("Failed to write config file: {}", config_file.display()))?;
+            
         Ok(())
     }
 }

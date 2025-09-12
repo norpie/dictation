@@ -15,4 +15,4 @@ uuid = { workspace = true }
 cpal = { workspace = true }
 nix = { workspace = true }
 dbus = { workspace = true }
-whisper-rs = { workspace = true }
+# whisper-rs = { workspace = true }

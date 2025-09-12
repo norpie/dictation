@@ -44,6 +44,8 @@
               # Build tools
               pkg-config
               cmake
+              clang
+              llvm
               
               # Audio libraries
               pipewire
@@ -74,6 +76,7 @@
               export PKG_CONFIG_PATH="${pipewire.dev}/lib/pkgconfig:${alsa-lib.dev}/lib/pkgconfig:${gtk4.dev}/lib/pkgconfig:${libadwaita.dev}/lib/pkgconfig:${dbus.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
               export WHISPER_CPP_LIB_DIR="${whisper-cpp}/lib"
               export WHISPER_CPP_INCLUDE_DIR="${whisper-cpp}/include"
+              export LIBCLANG_PATH="${clang.cc}/lib"
               echo "Dictation development environment ready!"
             '';
           };
@@ -91,6 +94,8 @@
           nativeBuildInputs = with pkgs; [
             pkg-config
             cmake
+            clang
+            llvm
           ];
           
           buildInputs = with pkgs; [
