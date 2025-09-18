@@ -38,30 +38,30 @@ pub mod protocol {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     
     pub async fn send_message<T: Serialize>(
-        stream: &mut UnixStream, 
+        stream: &mut UnixStream,
         message: &T
     ) -> Result<()> {
-        let serialized = bincode::serialize(message)?;
+        let serialized = rmp_serde::to_vec(message)?;
         let len = serialized.len() as u32;
-        
+
         stream.write_all(&len.to_le_bytes()).await?;
         stream.write_all(&serialized).await?;
         stream.flush().await?;
-        
+
         Ok(())
     }
-    
+
     pub async fn receive_message<T: for<'de> Deserialize<'de>>(
         stream: &mut UnixStream
     ) -> Result<T> {
         let mut len_bytes = [0u8; 4];
         stream.read_exact(&mut len_bytes).await?;
         let len = u32::from_le_bytes(len_bytes) as usize;
-        
+
         let mut buffer = vec![0u8; len];
         stream.read_exact(&mut buffer).await?;
-        
-        let message = bincode::deserialize(&buffer)?;
+
+        let message = rmp_serde::from_slice(&buffer)?;
         Ok(message)
     }
 }
