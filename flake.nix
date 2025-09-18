@@ -2,7 +2,7 @@
   description = "Whisper dictation app for Wayland Linux";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "path:/home/norpie/repos/nixpkgs";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
   };
@@ -33,8 +33,17 @@
             systemd
             whisper-cpp
             rocmPackages.clr
-            rocmPackages.rocblas  
+            rocmPackages.rocblas
             rocmPackages.hipblas
+            rocmPackages.hiprand
+            rocmPackages.rocrand
+            rocmPackages.rocprim
+            rocmPackages.rocthrust
+            rocmPackages.hipcub
+            rocmPackages.rocfft
+            rocmPackages.miopen
+            zstd
+            zlib
           ];
       in {
         devShells.default = with pkgs;
@@ -43,38 +52,44 @@
               (rust-bin.stable.latest.default.override {
                 extensions = ["rust-src" "rust-analyzer"];
               })
-              
+
+              # Python for daemon
+              python313
+              python313Packages.pip
+              python313Packages.virtualenv
+              python313Packages.ctranslate2-rocm
+              (python313Packages.torch.override { rocmSupport = true; })
+              (python313Packages.torchaudio.override { rocmSupport = true; })
+
               # Build tools
               pkg-config
+              just
               cmake
               clang
               llvm
-              
+              lld
+
               # Audio libraries
               pipewire
               alsa-lib
-              
+              portaudio
+
               # UI libraries
               gtk4
               libadwaita
-              
+
               # System libraries
               dbus
               systemd
-              
+
               # Whisper dependencies
               whisper-cpp
-              
-              # ROCm dependencies for AMD GPU acceleration
-              rocmPackages.clr
-              rocmPackages.rocblas  
-              rocmPackages.hipblas
-              rocmPackages.rocminfo
-              
+
+
               # Wayland tools
               wl-clipboard
               libnotify
-              
+
               # Development tools
               cargo-watch
               cargo-edit
@@ -83,18 +98,18 @@
             shellHook = ''
               export LD_LIBRARY_PATH=${libs}
               export PKG_CONFIG_PATH="${pipewire.dev}/lib/pkgconfig:${alsa-lib.dev}/lib/pkgconfig:${gtk4.dev}/lib/pkgconfig:${libadwaita.dev}/lib/pkgconfig:${dbus.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
-              export WHISPER_CPP_LIB_DIR="${whisper-cpp}/lib"
-              export WHISPER_CPP_INCLUDE_DIR="${whisper-cpp}/include"
-              export LIBCLANG_PATH="${pkgs.llvmPackages_latest.libclang.lib}/lib"
-              export WHISPER_DONT_GENERATE_BINDINGS=1
-              
+
               # ROCm configuration for AMD RX 7900 XTX
               export HSA_OVERRIDE_GFX_VERSION=11.0.0
               export AMDGPU_TARGETS=gfx1100
-              export HIP_PATH="${rocmPackages.clr}"
-              export PATH="${rocmPackages.clr}/bin:$PATH"
-              
-              echo "Dictation development environment ready with ROCm GPU support!"
+
+              # Python virtual environment with system site packages
+              if [ ! -d "daemon-py/venv" ]; then
+                python3 -m venv daemon-py/venv --system-site-packages
+              fi
+              source daemon-py/venv/bin/activate
+
+              echo "Dictation development environment ready with ROCm GPU support and Python venv!"
             '';
           };
           
