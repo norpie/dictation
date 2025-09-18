@@ -1,7 +1,6 @@
 [workspace]
 members = [
-    "daemon",
-    "client", 
+    "client",
     "popup",
     "shared",
 ]
