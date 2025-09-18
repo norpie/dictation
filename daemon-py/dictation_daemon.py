@@ -5,31 +5,19 @@ RealtimeSTT handles all the voice detection and streaming logic.
 """
 
 import os
-
-# Set ROCm environment variables BEFORE any imports
-os.environ['HSA_OVERRIDE_GFX_VERSION'] = '11.0.0'
-os.environ['HIP_VISIBLE_DEVICES'] = '0'
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-# Additional ROCm environment variables for PyTorch
-os.environ['PYTORCH_ROCM_ARCH'] = 'gfx1100'
-os.environ['HSA_ENABLE_SDMA'] = '0'
-# Set library path for ROCm CTranslate2
-home_dir = os.path.expanduser('~')
-ctranslate2_lib_path = f"{home_dir}/repos/dictation/CTranslate2-rocm/CTranslate2-rocm/build"
-lib_path = f"{ctranslate2_lib_path}:{home_dir}/.local/lib64:{home_dir}/.local/lib"
-if 'LD_LIBRARY_PATH' in os.environ:
-    os.environ['LD_LIBRARY_PATH'] = f"{lib_path}:{os.environ['LD_LIBRARY_PATH']}"
-else:
-    os.environ['LD_LIBRARY_PATH'] = lib_path
-
 import asyncio
 import socket
 import struct
 import msgpack
 import logging
 from pathlib import Path
-from RealtimeSTT import AudioToTextRecorder
 import uuid
+import numpy as np
+import pyaudio
+import faster_whisper
+import threading
+import queue
+from collections import deque
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,29 +25,135 @@ logger = logging.getLogger(__name__)
 
 class DictationDaemon:
     def __init__(self):
-        self.recorder = None
         self.current_session_id = None
         self.client_writer = None
         self.transcription_complete = False
 
-        # Pre-initialize model on startup for easier testing
-        logger.info("Initializing Whisper model on startup...")
+        # Audio recording state
+        self.recording = False
+        self.audio_thread = None
+        self.transcription_thread = None
+
+        # Overlap handling for continuous transcription
+        self.full_transcript = ""  # Complete internal transcript
+        self.last_sent_length = 0  # Track what we've already sent
+
+        # Audio parameters
+        self.CHUNK = 1024
+        self.FORMAT = pyaudio.paInt16
+        self.CHANNELS = 1
+        self.RATE = 16000
+
+        # Audio buffer and queue - longer buffer for better context
+        self.audio_buffer = deque(maxlen=int(self.RATE * 10 / self.CHUNK))  # 10 seconds
+        self.audio_queue = queue.Queue()
+        self.chunk_counter = 0
+
+        # Event loop for async operations from threads
+        self.loop = None
+
+        # Initialize faster-whisper model directly
+        logger.info("Initializing faster-whisper model...")
         try:
-            from RealtimeSTT import AudioToTextRecorder
-            # Test model initialization
-            test_recorder = AudioToTextRecorder(
-                model="large-v3",  # Use large-v3 model for best accuracy
-                device="cuda",
-                enable_realtime_transcription=False
-            )
-            test_recorder = None  # Clean up
-            logger.info("✅ Whisper model initialization successful")
+            self.model = faster_whisper.WhisperModel("large-v3", device="cuda")
+            logger.info("✅ faster-whisper model initialized successfully")
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Whisper model: {e}")
+            logger.error(f"❌ Failed to initialize faster-whisper model: {e}")
             raise
+
+    def normalize_for_matching(self, text):
+        """Normalize text for overlap detection"""
+        import re
+        # Remove punctuation and convert to lowercase
+        text = re.sub(r'[^\w\s]', '', text.lower())
+        # Normalize whitespace
+        return ' '.join(text.split())
+
+    def find_longest_common_overlap(self, existing_text, new_text):
+        """Find the longest overlap between end of existing_text and start of new_text"""
+        if not existing_text or not new_text:
+            return 0
+
+        # Normalize both texts for comparison
+        existing_norm = self.normalize_for_matching(existing_text)
+        new_norm = self.normalize_for_matching(new_text)
+
+        logger.debug(f"Normalized existing: '{existing_norm}'")
+        logger.debug(f"Normalized new: '{new_norm}'")
+
+        # Simple approach: look for the longest suffix of existing that matches prefix of new
+        existing_words = existing_norm.split()
+        new_words = new_norm.split()
+
+        max_overlap = min(len(existing_words), len(new_words))
+
+        # Find longest word-based overlap
+        for overlap_len in range(max_overlap, 0, -1):
+            if existing_words[-overlap_len:] == new_words[:overlap_len]:
+                logger.debug(f"Found {overlap_len}-word overlap: '{' '.join(new_words[:overlap_len])}'")
+
+                # Now find where this overlap ends in the original new_text
+                # Simple approach: split original text and count words
+                original_words = new_text.split()
+                char_pos = 0
+                words_counted = 0
+
+                for word in original_words:
+                    if words_counted < overlap_len:
+                        char_pos += len(word) + 1  # +1 for space
+                        words_counted += 1
+                    else:
+                        break
+
+                return char_pos
+
+        return 0
+
+    def update_transcript(self, new_transcription):
+        """Update internal transcript and return only new content for partial updates"""
+        if not new_transcription.strip():
+            return ""
+
+        # For the first transcription, just use it
+        if not self.full_transcript:
+            self.full_transcript = new_transcription.strip()
+            logger.info(f"First transcription: '{new_transcription.strip()}'")
+            return new_transcription.strip()
+
+        logger.info(f"Looking for overlap between:")
+        logger.info(f"  Existing: '{self.full_transcript}'")
+        logger.info(f"  New:      '{new_transcription}'")
+
+        # Find overlap position
+        overlap_pos = self.find_longest_common_overlap(self.full_transcript, new_transcription)
+        logger.info(f"Overlap position found: {overlap_pos}")
+
+        if overlap_pos > 0:
+            # Extract only the new part
+            new_part = new_transcription[overlap_pos:].strip()
+            if new_part:
+                self.full_transcript = self.full_transcript + " " + new_part
+                logger.info(f"OVERLAP DETECTED - Added new content: '{new_part}'")
+                return new_part
+            else:
+                logger.info("OVERLAP DETECTED - No new content")
+                return ""
+        else:
+            # Check if new transcription is completely contained in existing
+            if new_transcription.lower().strip() in self.full_transcript.lower():
+                logger.info(f"CONTAINED - New transcription already exists in full transcript")
+                return ""
+
+            # No overlap found - this might be a completely new sentence
+            self.full_transcript = self.full_transcript + " " + new_transcription
+            logger.info(f"NO OVERLAP - Appending entire new transcription: '{new_transcription}'")
+            return new_transcription
 
     async def start_server(self):
         """Start the Unix domain socket server"""
+        # Store the event loop for thread communication
+        self.loop = asyncio.get_event_loop()
+
         socket_path = Path("/tmp/dictation.sock")
 
         # Remove existing socket file
@@ -103,8 +197,8 @@ class DictationDaemon:
             writer.close()
             await writer.wait_closed()
             self.client_writer = None
-            if self.recorder:
-                self.recorder.stop()
+            if self.recording:
+                self.recording = False
             logger.info("Client disconnected")
 
     async def handle_message(self, message):
@@ -123,93 +217,171 @@ class DictationDaemon:
             return
 
     async def start_recording(self):
-        """Start recording with RealtimeSTT"""
+        """Start recording with faster-whisper"""
         try:
             # Generate session ID
             session_uuid = uuid.uuid4()
             self.current_session_id = str(session_uuid)
             self.transcription_complete = False
 
+            # Reset transcript tracking for new session
+            self.full_transcript = ""
+            self.last_sent_length = 0
+
             # Send recording started message (UUID as bytes)
             await self.send_message({'RecordingStarted': session_uuid.bytes})
 
-            # Initialize RealtimeSTT with callbacks
-            self.recorder = AudioToTextRecorder(
-                enable_realtime_transcription=True,
-                on_realtime_transcription_update=self.on_transcription_update,
-                on_realtime_transcription_stabilized=self.on_transcription_finished,
-                model="large-v3",  # Use large-v3 model for best accuracy
-                language="en",     # English only
-                device="cuda"      # ROCm appears as CUDA to PyTorch
-            )
+            # Start recording
+            self.recording = True
 
-            # Start recording in background
-            asyncio.create_task(self.run_recorder())
+            # Start audio capture thread
+            self.audio_thread = threading.Thread(target=self._audio_capture)
+            self.audio_thread.start()
+
+            # Start transcription thread
+            self.transcription_thread = threading.Thread(target=self._transcription_worker)
+            self.transcription_thread.start()
+
+            logger.info("🎤 Live transcription started")
 
         except Exception as e:
             logger.error(f"Error starting recording: {e}")
             await self.send_message({'Error': str(e)})
 
-    async def run_recorder(self):
-        """Run the recorder in a background task"""
-        try:
-            # This will block until recording is stopped
-            final_text = self.recorder.text()
+    def _audio_capture(self):
+        """Capture audio in real-time"""
+        p = pyaudio.PyAudio()
+        stream = p.open(format=self.FORMAT,
+                       channels=self.CHANNELS,
+                       rate=self.RATE,
+                       input=True,
+                       frames_per_buffer=self.CHUNK)
 
-            # Send final transcription
-            if not self.transcription_complete:
-                import time
-                session_uuid_bytes = uuid.UUID(self.current_session_id).bytes
-                await self.send_message({
-                    'TranscriptionComplete': {
-                        'id': session_uuid_bytes,
-                        'status': 'Completed',
-                        'text': final_text,
-                        'confidence': 1.0,
-                        'created_at': {'secs_since_epoch': int(time.time()), 'nanos_since_epoch': 0}
-                    }
-                })
-                self.transcription_complete = True
+        try:
+            while self.recording:
+                data = stream.read(self.CHUNK, exception_on_overflow=False)
+                self.audio_buffer.append(data)
+                self.chunk_counter += 1
+
+                # Every 3 seconds, queue audio for transcription (longer segments)
+                if self.chunk_counter % int(self.RATE * 3 / self.CHUNK) == 0:
+                    # Convert buffer to numpy array
+                    audio_data = b''.join(list(self.audio_buffer))
+                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+                    # Check audio level and queue for transcription
+                    max_amplitude = np.max(np.abs(audio_np))
+                    logger.info(f"Audio chunk: max_amplitude={max_amplitude:.4f}, length={len(audio_np)/self.RATE:.2f}s")
+
+                    # Lower threshold for better sensitivity
+                    if max_amplitude > 0.005:
+                        logger.info(f"Queueing audio chunk for transcription")
+                        self.audio_queue.put(audio_np.copy())
+                    else:
+                        logger.info(f"Skipping quiet audio chunk")
 
         except Exception as e:
-            logger.error(f"Error in recorder: {e}")
-            if self.client_writer:
-                await self.send_message({'Error': str(e)})
+            logger.error(f"Audio capture error: {e}")
+        finally:
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
 
-    def on_transcription_update(self, text):
-        """Callback for real-time transcription updates"""
-        if self.client_writer and not self.transcription_complete:
-            # Send update in async context
-            session_uuid_bytes = uuid.UUID(self.current_session_id).bytes
-            asyncio.create_task(self.send_message({
-                'TranscriptionUpdate': {
-                    'session_id': session_uuid_bytes,
-                    'partial_text': text
-                }
-            }))
+    def _transcription_worker(self):
+        """Process audio chunks for transcription"""
+        logger.info("Transcription worker started")
+        while self.recording or not self.audio_queue.empty():
+            try:
+                # Get audio chunk with timeout
+                audio_chunk = self.audio_queue.get(timeout=0.5)
+                logger.info(f"Got audio chunk for transcription, length: {len(audio_chunk)/self.RATE:.2f}s")
 
-    def on_transcription_finished(self, text):
-        """Callback for final transcription"""
-        if self.client_writer and not self.transcription_complete:
-            self.transcription_complete = True
-            # Send final result
-            import time
-            session_uuid_bytes = uuid.UUID(self.current_session_id).bytes
-            asyncio.create_task(self.send_message({
-                'TranscriptionComplete': {
-                    'id': session_uuid_bytes,
-                    'status': 'Completed',
-                    'text': text,
-                    'confidence': 1.0,
-                    'created_at': {'secs_since_epoch': int(time.time()), 'nanos_since_epoch': 0}
-                }
-            }))
+                # Transcribe with settings optimized for continuous speech
+                logger.info("Starting transcription...")
+                segments, info = self.model.transcribe(
+                    audio_chunk,
+                    language="en",
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=200),
+                    beam_size=5,
+                    best_of=5
+                )
+                logger.info(f"Transcription complete, detected language: {info.language}, segments: {len(list(segments))}")
+
+                # Process segments again since iterator was consumed
+                segments, info = self.model.transcribe(
+                    audio_chunk,
+                    language="en",
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=200),
+                    beam_size=5,
+                    best_of=5
+                )
+
+                # Combine all segments into one transcription
+                current_transcription = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+
+                if current_transcription:
+                    logger.info(f"Current transcription: '{current_transcription}'")
+
+                    # Update internal transcript and get only new content
+                    new_content = self.update_transcript(current_transcription)
+
+                    # Send only new content as partial update
+                    if new_content and self.client_writer and not self.transcription_complete:
+                        session_uuid_bytes = uuid.UUID(self.current_session_id).bytes
+
+                        # Send only the new part as partial update
+                        if self.loop and not self.loop.is_closed():
+                            logger.info(f"Sending partial update: '{new_content}'")
+                            asyncio.run_coroutine_threadsafe(
+                                self.send_message({
+                                    'TranscriptionUpdate': {
+                                        'session_id': session_uuid_bytes,
+                                        'partial_text': new_content
+                                    }
+                                }),
+                                self.loop
+                            )
+                else:
+                    logger.info("No segments detected in audio chunk")
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Transcription error: {e}")
 
     async def stop_recording(self):
         """Stop recording"""
-        if self.recorder:
-            self.recorder.stop()
-            self.recorder = None
+        self.recording = False
+
+        # Wait for threads to finish
+        if self.audio_thread and self.audio_thread.is_alive():
+            self.audio_thread.join(timeout=2)
+        if self.transcription_thread and self.transcription_thread.is_alive():
+            self.transcription_thread.join(timeout=2)
+
+        logger.info("⏹️ Recording stopped")
+
+        # Send final complete transcript
+        if self.full_transcript and self.client_writer:
+            import time
+            current_time = time.time()
+
+            # Create TranscriptionSession object matching Rust struct
+            session_obj = {
+                'id': uuid.UUID(self.current_session_id).bytes,
+                'status': 'Completed',  # SessionStatus::Completed
+                'text': self.full_transcript,
+                'confidence': None,
+                'created_at': {
+                    'secs_since_epoch': int(current_time),
+                    'nanos_since_epoch': int((current_time % 1) * 1_000_000_000)
+                }
+            }
+
+            logger.info(f"Sending final transcript: '{self.full_transcript}'")
+            await self.send_message({'TranscriptionComplete': session_obj})
 
         await self.send_message('RecordingStopped')
 

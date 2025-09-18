@@ -53,14 +53,6 @@
                 extensions = ["rust-src" "rust-analyzer"];
               })
 
-              # Python for daemon
-              python313
-              python313Packages.pip
-              python313Packages.virtualenv
-              python313Packages.ctranslate2-rocm
-              (python313Packages.torch.override { rocmSupport = true; })
-              (python313Packages.torchaudio.override { rocmSupport = true; })
-
               # Build tools
               pkg-config
               just
@@ -68,6 +60,14 @@
               clang
               llvm
               lld
+
+              # Python for daemon
+              python313
+              python313Packages.pip
+              python313Packages.virtualenv
+              python313Packages.ctranslate2-rocm
+              # (python313Packages.torch.override { rocmSupport = true; })
+              # (python313Packages.torchaudio.override { rocmSupport = true; })
 
               # Audio libraries
               pipewire
@@ -85,7 +85,6 @@
               # Whisper dependencies
               whisper-cpp
 
-
               # Wayland tools
               wl-clipboard
               libnotify
@@ -102,12 +101,16 @@
               # ROCm configuration for AMD RX 7900 XTX
               export HSA_OVERRIDE_GFX_VERSION=11.0.0
               export AMDGPU_TARGETS=gfx1100
+              export HIP_VISIBLE_DEVICES=0
+              export CUDA_VISIBLE_DEVICES=0
+              export PYTORCH_ROCM_ARCH=gfx1100
+              export HSA_ENABLE_SDMA=0
 
               # Python virtual environment with system site packages
-              if [ ! -d "daemon-py/venv" ]; then
-                python3 -m venv daemon-py/venv --system-site-packages
+              if [ ! -d "daemon-py/.venv" ]; then
+                python3 -m venv daemon-py/.venv --system-site-packages
               fi
-              source daemon-py/venv/bin/activate
+              source daemon-py/.venv/bin/activate
 
               echo "Dictation development environment ready with ROCm GPU support and Python venv!"
             '';
