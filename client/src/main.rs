@@ -4,9 +4,6 @@ use log::{info, error, debug, warn};
 use shared::{Config, ClientMessage, DaemonMessage, protocol};
 use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
-use uuid::Uuid;
-
-mod audio;
 
 #[derive(Parser)]
 #[command(name = "dictation-client")]
@@ -68,11 +65,11 @@ async fn main() -> Result<()> {
     match response {
         DaemonMessage::RecordingStarted(session_id) => {
             println!("✓ Recording started with session ID: {}", session_id);
-            
-            // If this is a start recording command, begin audio capture
+
+            // If this is a start recording command, listen for transcription updates
             if args.start {
-                if let Err(e) = start_audio_capture(&config, session_id, &mut stream).await {
-                    error!("Failed to start audio capture: {}", e);
+                if let Err(e) = listen_for_transcription(&mut stream).await {
+                    error!("Failed to listen for transcription: {}", e);
                     return Err(e);
                 }
             }
@@ -100,105 +97,50 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn start_audio_capture(
-    config: &Config,
-    session_id: Uuid,
-    stream: &mut UnixStream,
-) -> Result<()> {
-    info!("Starting audio capture for session {}", session_id);
-    
-    let mut audio_capture = audio::AudioCapture::new(&config.audio)?;
-    let mut audio_rx = audio_capture.start_recording(session_id)?;
-    
-    println!("🎤 Recording audio... Press Ctrl+C to stop");
-    
-    // Stream audio chunks to daemon
-    let mut chunk_count = 0;
-    let recording_timeout = Duration::from_secs(30); // 30 second max recording
-    
-    let audio_streaming = async {
-        let mut exit_reason = "Audio stream ended";
-        
-        while let Some(audio_chunk) = audio_rx.recv().await {
-            chunk_count += 1;
-            debug!("Sending audio chunk {} with {} samples", chunk_count, audio_chunk.data.len());
-            
-            // Send audio chunk to daemon
-            let message = ClientMessage::StreamAudio(audio_chunk);
-            if let Err(e) = protocol::send_message(stream, &message).await {
-                error!("Failed to send audio chunk: {}", e);
-                exit_reason = "Failed to send audio to daemon";
-                break;
-            }
-            
-            // Check for daemon response (transcription updates)
-            if let Ok(response_result) = timeout(Duration::from_millis(10), protocol::receive_message::<DaemonMessage>(stream)).await {
-                match response_result {
-                    Ok(DaemonMessage::TranscriptionUpdate { session_id: _, partial_text }) => {
+async fn listen_for_transcription(stream: &mut UnixStream) -> Result<()> {
+    println!("🎤 Recording... Speak now! (RealtimeSTT will handle audio capture)");
+
+    // Listen for transcription updates from daemon
+    loop {
+        let timeout_duration = Duration::from_secs(60); // 60 second timeout
+
+        match timeout(timeout_duration, protocol::receive_message::<DaemonMessage>(stream)).await {
+            Ok(Ok(response)) => {
+                match response {
+                    DaemonMessage::TranscriptionUpdate { session_id: _, partial_text } => {
                         if !partial_text.is_empty() {
-                            println!("\r🔄 Partial: {}", partial_text);
+                            print!("\r🔄 Partial: {}", partial_text);
+                            use std::io::{self, Write};
+                            io::stdout().flush().unwrap();
                         }
                     }
-                    Ok(DaemonMessage::TranscriptionComplete(session)) => {
+                    DaemonMessage::TranscriptionComplete(session) => {
                         println!("\n✅ Final: {}", session.text);
-                        exit_reason = "Transcription completed by daemon";
                         break;
                     }
-                    Ok(DaemonMessage::Error(error)) => {
+                    DaemonMessage::RecordingStopped => {
+                        println!("\n🔚 Recording stopped");
+                        break;
+                    }
+                    DaemonMessage::Error(error) => {
                         error!("Daemon error during recording: {}", error);
-                        exit_reason = "Daemon reported an error";
                         break;
                     }
-                    Ok(other) => {
-                        debug!("Received other message during recording: {:?}", other);
-                    }
-                    Err(e) => {
-                        debug!("No response from daemon: {}", e);
-                        // Continue recording
+                    other => {
+                        debug!("Received unexpected message: {:?}", other);
                     }
                 }
             }
-        }
-        
-        info!("Audio streaming completed after {} chunks. Reason: {}", chunk_count, exit_reason);
-        exit_reason
-    };
-    
-    // Run audio streaming with timeout
-    let final_reason = match timeout(recording_timeout, audio_streaming).await {
-        Ok(reason) => {
-            info!("Recording completed successfully");
-            reason
-        }
-        Err(_) => {
-            warn!("Recording timed out after {} seconds", recording_timeout.as_secs());
-            "30-second timeout reached"
-        }
-    };
-    
-    println!("🔚 Recording ended: {}", final_reason);
-    
-    // Stop recording
-    audio_capture.stop_recording();
-    
-    // Send stop recording message to daemon
-    let stop_message = ClientMessage::StopRecording;
-    protocol::send_message(stream, &stop_message).await?;
-    
-    // Wait for confirmation
-    if let Ok(response) = timeout(Duration::from_secs(5), protocol::receive_message::<DaemonMessage>(stream)).await {
-        match response? {
-            DaemonMessage::RecordingStopped => {
-                println!("✓ Recording stopped");
+            Ok(Err(e)) => {
+                error!("Error receiving message: {}", e);
+                break;
             }
-            DaemonMessage::TranscriptionComplete(session) => {
-                println!("✅ Final transcription: {}", session.text);
-            }
-            other => {
-                debug!("Received unexpected stop response: {:?}", other);
+            Err(_) => {
+                warn!("Timeout waiting for transcription");
+                break;
             }
         }
     }
-    
+
     Ok(())
 }
