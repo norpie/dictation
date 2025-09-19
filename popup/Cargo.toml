@@ -2,6 +2,17 @@
 name = "dictation-popup"
 version = "0.1.0"
 edition = "2021"
+authors = ["Konsta Kuosmanen <konsta@kuosmanen.dev>"]
+description = "Voice dictation popup UI for Wayland Linux with Whisper speech recognition"
+repository = "https://github.com/norpie/dictation"
+license = "MIT OR Apache-2.0"
+keywords = ["dictation", "speech", "whisper", "wayland", "gui"]
+categories = ["command-line-utilities", "gui"]
+readme = "../README.md"
+
+[[bin]]
+name = "dictation-popup"
+path = "src/main.rs"
 
 [dependencies]
 shared = { path = "../shared" }
