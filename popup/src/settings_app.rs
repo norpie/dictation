@@ -6,6 +6,7 @@ pub struct SettingsApp {
     model: String,
     timeout: f32,
     language: String,
+    fuzzy_match_threshold: f32,
     auto_copy: bool,
     auto_close_after_copy: bool,
 }
@@ -16,6 +17,7 @@ impl SettingsApp {
         let model = config.model();
         let timeout = config.model_timeout_seconds() as f32;
         let language = config.language();
+        let fuzzy_match_threshold = config.fuzzy_match_threshold();
         let auto_copy = config.auto_copy();
         let auto_close_after_copy = config.auto_close_after_copy();
 
@@ -24,6 +26,7 @@ impl SettingsApp {
             model,
             timeout,
             language,
+            fuzzy_match_threshold,
             auto_copy,
             auto_close_after_copy,
         }
@@ -71,6 +74,11 @@ impl eframe::App for SettingsApp {
                 ui.text_edit_singleline(&mut self.language);
             });
 
+            ui.horizontal(|ui| {
+                ui.label("Fuzzy match threshold:");
+                ui.add(egui::Slider::new(&mut self.fuzzy_match_threshold, 0.5..=1.0).text("similarity"));
+            });
+
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(10.0);
@@ -97,12 +105,14 @@ impl eframe::App for SettingsApp {
                             model: Some(self.model.clone()),
                             model_timeout_seconds: Some(self.timeout as u32),
                             language: Some(self.language.clone()),
+                            fuzzy_match_threshold: Some(self.fuzzy_match_threshold),
                         });
                     } else {
                         let whisper_config = new_config.whisper.as_mut().unwrap();
                         whisper_config.model = Some(self.model.clone());
                         whisper_config.model_timeout_seconds = Some(self.timeout as u32);
                         whisper_config.language = Some(self.language.clone());
+                        whisper_config.fuzzy_match_threshold = Some(self.fuzzy_match_threshold);
                     }
 
                     // Update UI config

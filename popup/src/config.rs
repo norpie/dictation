@@ -12,6 +12,7 @@ pub struct WhisperConfig {
     pub model: Option<String>,
     pub model_timeout_seconds: Option<u32>,
     pub language: Option<String>,
+    pub fuzzy_match_threshold: Option<f32>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -49,6 +50,12 @@ impl Config {
         self.whisper.as_ref()
             .and_then(|w| w.language.clone())
             .unwrap_or_else(|| "en".to_string())
+    }
+
+    pub fn fuzzy_match_threshold(&self) -> f32 {
+        self.whisper.as_ref()
+            .and_then(|w| w.fuzzy_match_threshold)
+            .unwrap_or(0.8)
     }
 }
 

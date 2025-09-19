@@ -38,7 +38,11 @@ class DictationDaemon:
 
         # Audio and transcription handlers
         self.audio_handler = AudioHandler()
-        self.transcription_handler = TranscriptionHandler(self.model_manager, self.config.whisper.language)
+        self.transcription_handler = TranscriptionHandler(
+            self.model_manager,
+            self.config.whisper.language,
+            self.config.whisper.fuzzy_match_threshold
+        )
 
         # Session state
         self.full_transcript = ""
@@ -282,8 +286,9 @@ class DictationDaemon:
                 self.model_manager.model_name = new_model
                 self.model_manager.timeout_seconds = new_config.whisper.model_timeout_seconds
 
-                # Update transcription handler language
+                # Update transcription handler language and fuzzy threshold
                 self.transcription_handler.language = new_config.whisper.language
+                self.transcription_handler.fuzzy_threshold = new_config.whisper.fuzzy_match_threshold
 
             # Update config
             self.config = new_config

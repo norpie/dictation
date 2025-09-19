@@ -174,12 +174,14 @@ fn show_settings_window(ctx: &egui::Context, app: &mut DictationApp) {
                             model: Some(model),
                             model_timeout_seconds: Some(timeout as u32),
                             language: Some(language),
+                            fuzzy_match_threshold: Some(0.8),
                         });
                     } else {
                         let whisper_config = new_config.whisper.as_mut().unwrap();
                         whisper_config.model = Some(model);
                         whisper_config.model_timeout_seconds = Some(timeout as u32);
                         whisper_config.language = Some(language);
+                        whisper_config.fuzzy_match_threshold = Some(0.8);
                     }
 
                     // Update UI config

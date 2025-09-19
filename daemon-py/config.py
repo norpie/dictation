@@ -15,6 +15,7 @@ class WhisperConfig:
     model: str = "distil-large-v3"
     model_timeout_seconds: int = 300
     language: str = "en"
+    fuzzy_match_threshold: float = 0.8
 
 @dataclass
 class UIConfig:
@@ -49,6 +50,7 @@ def load_config() -> Config:
             config.whisper.model = whisper_data.get("model", config.whisper.model)
             config.whisper.model_timeout_seconds = whisper_data.get("model_timeout_seconds", config.whisper.model_timeout_seconds)
             config.whisper.language = whisper_data.get("language", config.whisper.language)
+            config.whisper.fuzzy_match_threshold = whisper_data.get("fuzzy_match_threshold", config.whisper.fuzzy_match_threshold)
 
         # Load UI config
         if "ui" in toml_data:

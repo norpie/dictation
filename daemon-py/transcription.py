@@ -11,9 +11,10 @@ from utils import find_longest_common_overlap
 logger = logging.getLogger(__name__)
 
 class TranscriptionHandler:
-    def __init__(self, model_manager, language="en"):
+    def __init__(self, model_manager, language="en", fuzzy_threshold=0.8):
         self.model_manager = model_manager
         self.language = language
+        self.fuzzy_threshold = fuzzy_threshold
         self.processing = False
         self.transcription_thread = None
         self.loop = None
@@ -140,9 +141,9 @@ class TranscriptionHandler:
         logger.info(f"  Existing: '{self.full_transcript}'")
         logger.info(f"  New:      '{new_transcription}'")
 
-        # Find overlap position
-        overlap_pos = find_longest_common_overlap(self.full_transcript, new_transcription)
-        logger.info(f"Overlap position found: {overlap_pos}")
+        # Find overlap position using fuzzy matching
+        overlap_pos = find_longest_common_overlap(self.full_transcript, new_transcription, self.fuzzy_threshold)
+        logger.info(f"Overlap position found: {overlap_pos} (fuzzy threshold: {self.fuzzy_threshold})")
 
         if overlap_pos > 0:
             # Extract only the new part
