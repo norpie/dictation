@@ -33,6 +33,11 @@ pub enum DaemonMessage {
     ProcessingStarted,         // Started transcribing audio chunk
     ProcessingComplete,        // Finished transcribing chunk
 
+    // Model management
+    ModelLoading,              // Model is being loaded into VRAM
+    ModelLoaded,               // Model is ready for use
+    ModelUnloaded,             // Model has been unloaded from VRAM
+
     // Status and session management
     Error(String),
     Status(DaemonStatus),

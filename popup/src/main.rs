@@ -36,15 +36,12 @@ fn main() -> Result<()> {
 struct DictationApp {
     text: String,
     complete_text: String,
-    recording_status: String,
     daemon_connected: bool,
     is_recording: bool,
     session_id: Option<Uuid>,
 
-    // Real-time feedback state
-    audio_level: f32,
-    voice_active: bool,
-    is_processing: bool,
+    // UI state
+    model_loading: bool,
 
     rx: mpsc::Receiver<UiMessage>,
     _tx: mpsc::Sender<UiMessage>, // Keep sender alive
@@ -59,11 +56,11 @@ enum UiMessage {
     TranscriptionComplete(String),
 
     // Real-time feedback
-    AudioLevel(f32),
-    VoiceActivityDetected,
-    VoiceActivityEnded,
-    ProcessingStarted,
-    ProcessingComplete,
+
+    // Model management
+    ModelLoading,
+    ModelLoaded,
+    ModelUnloaded,
 
     // Session management
     SessionCleared,
@@ -81,17 +78,14 @@ impl DictationApp {
         });
 
         Self {
-            text: initial_text.unwrap_or_else(|| "Starting...".to_string()),
+            text: initial_text.unwrap_or_else(|| String::new()),
             complete_text: String::new(),
-            recording_status: "Connecting to daemon...".to_string(),
             daemon_connected: false,
             is_recording: false,
             session_id: None,
 
-            // Initialize feedback state
-            audio_level: 0.0,
-            voice_active: false,
-            is_processing: false,
+            // Initialize UI state
+            model_loading: false,
 
             rx,
             _tx: tx,
@@ -103,24 +97,16 @@ impl DictationApp {
             match message {
                 UiMessage::DaemonConnected(connected) => {
                     self.daemon_connected = connected;
-                    if connected {
-                        self.recording_status = "🔴 Recording...".to_string();
-                        self.text = "".to_string();
-                        self.complete_text = String::new();
-                    } else {
-                        self.recording_status = "Daemon not available".to_string();
-                    }
+                    // Daemon connection handled at startup - no need for status messages
                 }
                 UiMessage::RecordingStarted(session_id) => {
                     self.session_id = Some(session_id);
                     self.is_recording = true;
-                    self.recording_status = "🔴 Recording...".to_string();
                     self.text = "".to_string();
                     self.complete_text = String::new();
                 }
                 UiMessage::RecordingStopped => {
                     self.is_recording = false;
-                    self.recording_status = "Recording stopped".to_string();
                     // Keep the final text for copying
                 }
                 UiMessage::TranscriptionUpdate(new_text, is_final) => {
@@ -139,44 +125,25 @@ impl DictationApp {
                     self.complete_text.push_str(&final_text);
                     self.text = self.complete_text.clone();
                     self.is_recording = false;
-                    self.recording_status = "Recording complete".to_string();
                     log::info!("Complete: '{}'", final_text);
                 }
-                // Real-time feedback messages
-                UiMessage::AudioLevel(level) => {
-                    self.audio_level = level;
+                // Real-time feedback messages (audio level removed)
+                // Model management messages
+                UiMessage::ModelLoading => {
+                    self.model_loading = true;
                 }
-                UiMessage::VoiceActivityDetected => {
-                    self.voice_active = true;
-                    if self.is_recording {
-                        self.recording_status = "🎤 Voice detected...".to_string();
-                    }
+                UiMessage::ModelLoaded => {
+                    self.model_loading = false;
                 }
-                UiMessage::VoiceActivityEnded => {
-                    self.voice_active = false;
-                    if self.is_recording {
-                        self.recording_status = "🔴 Recording...".to_string();
-                    }
-                }
-                UiMessage::ProcessingStarted => {
-                    self.is_processing = true;
-                    if self.is_recording {
-                        self.recording_status = "⚙️ Processing...".to_string();
-                    }
-                }
-                UiMessage::ProcessingComplete => {
-                    self.is_processing = false;
-                    if self.is_recording {
-                        self.recording_status = "🔴 Recording...".to_string();
-                    }
+                UiMessage::ModelUnloaded => {
+                    self.model_loading = false;
                 }
                 UiMessage::SessionCleared => {
                     self.complete_text.clear();
                     self.text.clear();
-                    self.recording_status = "Session cleared".to_string();
                 }
-                UiMessage::Error(error) => {
-                    self.recording_status = format!("Error: {}", error);
+                UiMessage::Error(_error) => {
+                    // Errors handled by daemon exit - no UI feedback needed
                 }
             }
         }
@@ -186,7 +153,6 @@ impl DictationApp {
         if self.is_recording {
             // Immediately update UI state
             self.is_recording = false;
-            self.recording_status = "Stopping...".to_string();
 
             // Send stop message through a new thread to avoid blocking UI
             std::thread::spawn(|| {
@@ -215,22 +181,22 @@ impl DictationApp {
                         if stdin.write_all(self.text.as_bytes()).is_ok() {
                             drop(stdin); // Close stdin
                             // Don't wait for child - let wl-copy run in background
-                            self.recording_status = "📋 Copied to clipboard!".to_string();
+
+                            // Use notify-send for clipboard notification
+                            let _ = std::process::Command::new("notify-send")
+                                .arg("Voice Dictation")
+                                .arg("Text copied to clipboard")
+                                .arg("--expire-time=2000")
+                                .spawn();
+
                             log::info!("Successfully copied to clipboard");
-                        } else {
-                            self.recording_status = "Copy failed: couldn't write to wl-copy".to_string();
                         }
-                    } else {
-                        self.recording_status = "Copy failed: couldn't get stdin".to_string();
                     }
                 }
                 Err(e) => {
-                    self.recording_status = format!("Copy failed: {}", e);
                     log::error!("Failed to spawn wl-copy: {}", e);
                 }
             }
-        } else {
-            self.recording_status = "No text to copy".to_string();
         }
     }
 }
@@ -262,61 +228,28 @@ impl eframe::App for DictationApp {
 
             ui.heading("Voice Dictation");
 
-            // Status line with daemon connection indicator
+            // Status indicator (3 states only)
             ui.horizontal(|ui| {
-                // Daemon connection status
-                let daemon_color = if self.daemon_connected {
-                    egui::Color32::GREEN
+                if self.model_loading {
+                    ui.colored_label(egui::Color32::YELLOW, "Loading model...");
+                } else if self.is_recording {
+                    // Pulsing red circle
+                    let time = ctx.input(|i| i.time) as f32;
+                    let pulse = (time * 3.0).sin() * 0.3 + 0.7; // Pulse between 0.4 and 1.0
+                    let red_component = (255.0 * pulse) as u8;
+                    let pulsing_red = egui::Color32::from_rgb(red_component, 0, 0);
+
+                    // Draw a filled circle instead of text
+                    let (rect, _response) = ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 6.0, pulsing_red);
+                    ui.label("Recording");
                 } else {
-                    egui::Color32::RED
-                };
-                ui.colored_label(daemon_color, "●");
-                ui.label(if self.daemon_connected {
-                    "Connected"
-                } else {
-                    "Disconnected"
-                });
-
-                ui.separator();
-
-                // Voice activity indicator
-                if self.is_recording {
-                    let voice_color = if self.voice_active {
-                        egui::Color32::from_rgb(255, 165, 0) // Orange
-                    } else {
-                        egui::Color32::GRAY
-                    };
-                    ui.colored_label(voice_color, "🎤");
-                    ui.label(if self.voice_active { "Voice" } else { "Silent" });
-
-                    ui.separator();
-
-                    // Processing indicator
-                    if self.is_processing {
-                        ui.colored_label(egui::Color32::BLUE, "⚙️");
-                        ui.label("Processing");
-                    }
+                    let (rect, _response) = ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 6.0, egui::Color32::GREEN);
+                    ui.label("Done");
                 }
             });
 
-            // Audio level meter (only show when recording)
-            if self.is_recording {
-                ui.horizontal(|ui| {
-                    ui.label("Audio Level:");
-                    let progress = egui::ProgressBar::new(self.audio_level)
-                        .desired_width(100.0)
-                        .show_percentage();
-                    ui.add(progress);
-                });
-            }
-
-            ui.separator();
-
-            // Recording status
-            ui.horizontal(|ui| {
-                ui.add_space(ui.available_width() / 2.0 - 50.0);
-                ui.label(&self.recording_status);
-            });
 
             ui.separator();
 
@@ -383,7 +316,7 @@ fn daemon_communication_thread(tx: mpsc::Sender<UiMessage>) {
                 let _ = tx.send(UiMessage::DaemonConnected(true));
 
                 // Start recording
-                match send_start_recording().await {
+                match send_start_recording(tx.clone()).await {
                     Ok((session_id, stream)) => {
                         let _ = tx.send(UiMessage::RecordingStarted(session_id));
 
@@ -396,7 +329,14 @@ fn daemon_communication_thread(tx: mpsc::Sender<UiMessage>) {
                 }
             }
             _ => {
-                let _ = tx.send(UiMessage::DaemonConnected(false));
+                // Daemon not available - show notification and exit
+                let _ = std::process::Command::new("notify-send")
+                    .arg("Voice Dictation")
+                    .arg("Daemon not available. Please start the daemon first.")
+                    .arg("--urgency=critical")
+                    .spawn();
+
+                std::process::exit(1);
             }
         }
     });
@@ -423,16 +363,36 @@ async fn check_daemon_status() -> Result<bool> {
     }
 }
 
-async fn send_start_recording() -> Result<(Uuid, UnixStream)> {
+async fn send_start_recording(tx: mpsc::Sender<UiMessage>) -> Result<(Uuid, UnixStream)> {
     let socket_path = "/tmp/dictation.sock";
     let mut stream = UnixStream::connect(socket_path).await?;
 
     protocol::send_message(&mut stream, &ClientMessage::StartRecording).await?;
 
-    match protocol::receive_message::<DaemonMessage>(&mut stream).await? {
-        DaemonMessage::RecordingStarted(session_id) => Ok((session_id, stream)),
-        DaemonMessage::Error(error) => anyhow::bail!("Daemon error: {}", error),
-        _ => anyhow::bail!("Unexpected response from daemon"),
+    // The daemon might send ModelLoading -> ModelLoaded -> RecordingStarted
+    // We need to wait for RecordingStarted specifically
+    loop {
+        match protocol::receive_message::<DaemonMessage>(&mut stream).await? {
+            DaemonMessage::RecordingStarted(session_id) => {
+                return Ok((session_id, stream));
+            }
+            DaemonMessage::ModelLoading => {
+                // Forward model loading message to UI
+                let _ = tx.send(UiMessage::ModelLoading);
+                continue;
+            }
+            DaemonMessage::ModelLoaded => {
+                // Forward model loaded message to UI
+                let _ = tx.send(UiMessage::ModelLoaded);
+                continue;
+            }
+            DaemonMessage::Error(error) => {
+                anyhow::bail!("Daemon error: {}", error);
+            }
+            other => {
+                anyhow::bail!("Unexpected response from daemon: {:?}", other);
+            }
+        }
     }
 }
 
@@ -464,21 +424,16 @@ async fn listen_for_daemon_messages(tx: mpsc::Sender<UiMessage>, session_id: Uui
                         let _ = tx.send(UiMessage::RecordingStopped);
                         return; // Exit listen loop
                     }
-                    // Real-time feedback messages
-                    DaemonMessage::AudioLevel(level) => {
-                        let _ = tx.send(UiMessage::AudioLevel(level));
+                    // Real-time feedback messages (audio level removed)
+                    // Model management messages
+                    DaemonMessage::ModelLoading => {
+                        let _ = tx.send(UiMessage::ModelLoading);
                     }
-                    DaemonMessage::VoiceActivityDetected => {
-                        let _ = tx.send(UiMessage::VoiceActivityDetected);
+                    DaemonMessage::ModelLoaded => {
+                        let _ = tx.send(UiMessage::ModelLoaded);
                     }
-                    DaemonMessage::VoiceActivityEnded => {
-                        let _ = tx.send(UiMessage::VoiceActivityEnded);
-                    }
-                    DaemonMessage::ProcessingStarted => {
-                        let _ = tx.send(UiMessage::ProcessingStarted);
-                    }
-                    DaemonMessage::ProcessingComplete => {
-                        let _ = tx.send(UiMessage::ProcessingComplete);
+                    DaemonMessage::ModelUnloaded => {
+                        let _ = tx.send(UiMessage::ModelUnloaded);
                     }
                     DaemonMessage::SessionCleared => {
                         let _ = tx.send(UiMessage::SessionCleared);

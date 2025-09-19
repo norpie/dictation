@@ -7,3 +7,4 @@ CLAUDE.md
 RealtimeSTT/
 daemon.log
 daemon-py/dictation_daemon.log
+daemon-py/__pycache__
