@@ -17,6 +17,7 @@ import pyaudio
 import faster_whisper
 import threading
 import queue
+import time
 from collections import deque
 
 # Configure logging
@@ -64,14 +65,87 @@ class DictationDaemon:
         # Event loop for async operations from threads
         self.loop = None
 
-        # Initialize faster-whisper model directly
-        logger.info("Initializing faster-whisper model...")
+        # Model management
+        self.model = None
+        self.model_loaded = False
+        self.last_activity_time = time.time()
+        self.model_timeout_seconds = 30  # 30 seconds for testing
+        self.timeout_task = None
+
+        # Don't load model at startup - load on demand to save VRAM
+        logger.info("Daemon ready - model will be loaded when needed")
+
+    def load_model(self):
+        """Load the faster-whisper model into VRAM"""
+        if self.model_loaded:
+            return
+
+        logger.info("🔄 Loading faster-whisper model...")
         try:
             self.model = faster_whisper.WhisperModel("distil-large-v3", device="cuda")
-            logger.info("✅ faster-whisper model initialized successfully")
+            self.model_loaded = True
+            logger.info("✅ faster-whisper model loaded successfully")
+
+            # Send model loaded message to clients if connected
+            if self.client_writer:
+                asyncio.run_coroutine_threadsafe(
+                    self.send_message({'ModelLoaded': None}),
+                    self.loop
+                )
         except Exception as e:
-            logger.error(f"❌ Failed to initialize faster-whisper model: {e}")
+            logger.error(f"❌ Failed to load faster-whisper model: {e}")
             raise
+
+    def unload_model(self):
+        """Unload the model to free VRAM"""
+        if not self.model_loaded:
+            return
+
+        logger.info("🗑️ Unloading faster-whisper model to free VRAM...")
+        self.model = None
+        self.model_loaded = False
+        logger.info("✅ Model unloaded successfully")
+
+        # Send model unloaded message to clients if connected
+        if self.client_writer:
+            asyncio.run_coroutine_threadsafe(
+                self.send_message({'ModelUnloaded': None}),
+                self.loop
+            )
+
+    def update_activity_time(self):
+        """Update the last activity time and reset timeout"""
+        self.last_activity_time = time.time()
+
+        # Cancel existing timeout task
+        if self.timeout_task and not self.timeout_task.done():
+            self.timeout_task.cancel()
+
+        # Schedule new timeout task (only if we have a loop and we're in the main thread)
+        if self.loop and not self.loop.is_closed():
+            try:
+                self.timeout_task = asyncio.run_coroutine_threadsafe(
+                    self._model_timeout_task(), self.loop
+                ).result() if hasattr(asyncio, 'current_task') else None
+
+                # Better approach: schedule from the loop thread
+                if hasattr(self.loop, 'call_soon_threadsafe'):
+                    def schedule_timeout():
+                        self.timeout_task = asyncio.create_task(self._model_timeout_task())
+                    self.loop.call_soon_threadsafe(schedule_timeout)
+            except Exception as e:
+                logger.debug(f"Could not schedule timeout task: {e}")
+
+    async def _model_timeout_task(self):
+        """Task that unloads the model after timeout"""
+        try:
+            await asyncio.sleep(self.model_timeout_seconds)
+            if self.model_loaded:
+                logger.info(f"⏰ Model timeout reached ({self.model_timeout_seconds}s), unloading model")
+                self.unload_model()
+        except asyncio.CancelledError:
+            # Timeout was reset, ignore
+            pass
 
     def normalize_for_matching(self, text):
         """Normalize text for overlap detection"""
@@ -282,6 +356,20 @@ class DictationDaemon:
     async def start_recording(self):
         """Start recording with faster-whisper"""
         try:
+            # Update activity time and reset timeout
+            self.update_activity_time()
+
+            # Check if model needs to be loaded
+            if not self.model_loaded:
+                logger.info("🔄 Model not loaded, loading before starting recording...")
+                await self.send_message({'ModelLoading': None})
+
+                # Load model in a separate thread to avoid blocking
+                def load_model_sync():
+                    self.load_model()
+
+                await asyncio.get_event_loop().run_in_executor(None, load_model_sync)
+
             # Generate session ID
             session_uuid = uuid.uuid4()
             self.current_session_id = str(session_uuid)
@@ -372,6 +460,9 @@ class DictationDaemon:
                 # Get audio chunk with timeout
                 audio_chunk = self.audio_queue.get(timeout=0.5)
                 logger.info(f"Got audio chunk for transcription, length: {len(audio_chunk)/self.RATE:.2f}s")
+
+                # Update activity time on each transcription
+                self.update_activity_time()
 
                 # Send processing started feedback
                 if self.loop and not self.loop.is_closed():
@@ -484,7 +575,7 @@ class DictationDaemon:
 
         await self.send_message({
             'Status': {
-                'model_loaded': True,
+                'model_loaded': self.model_loaded,
                 'active_sessions': active_sessions,
                 'uptime': {'secs': 0, 'nanos': 0},  # TODO: track uptime
                 'audio_device': "default",  # TODO: get actual device name
