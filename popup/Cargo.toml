@@ -16,3 +16,5 @@ uuid = { workspace = true }
 eframe = "0.28"
 egui = "0.28"
 arboard = "3.0"
+toml = "0.8"
+dirs = "5.0"

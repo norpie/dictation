@@ -5,6 +5,8 @@ use shared::ipc::{ClientMessage, DaemonMessage, protocol};
 use std::sync::mpsc;
 use tokio::net::UnixStream;
 use uuid::Uuid;
+use std::fs;
+use serde::Deserialize;
 
 #[derive(Parser)]
 #[command(name = "dictation-popup")]
@@ -12,6 +14,29 @@ use uuid::Uuid;
 struct Args {
     #[arg(short, long)]
     text: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct Config {
+    ui: Option<UIConfig>,
+}
+
+#[derive(Deserialize)]
+struct UIConfig {
+    auto_copy: Option<bool>,
+    auto_close_after_copy: Option<bool>,
+}
+
+fn load_config() -> Config {
+    let config_path = dirs::home_dir()
+        .map(|home| home.join(".config").join("dictation").join("config.toml"))
+        .unwrap_or_default();
+
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        toml::from_str(&content).unwrap_or_default()
+    } else {
+        Config::default()
+    }
 }
 
 fn main() -> Result<()> {
@@ -43,6 +68,10 @@ struct DictationApp {
     // UI state
     model_loading: bool,
 
+    // Config
+    auto_copy: bool,
+    auto_close_after_copy: bool,
+
     rx: mpsc::Receiver<UiMessage>,
     _tx: mpsc::Sender<UiMessage>, // Keep sender alive
 }
@@ -71,6 +100,15 @@ impl DictationApp {
     fn new(initial_text: Option<String>) -> Self {
         let (tx, rx) = mpsc::channel();
 
+        // Load config
+        let config = load_config();
+        let auto_copy = config.ui.as_ref()
+            .and_then(|ui| ui.auto_copy)
+            .unwrap_or(true); // Default to true
+        let auto_close_after_copy = config.ui.as_ref()
+            .and_then(|ui| ui.auto_close_after_copy)
+            .unwrap_or(true); // Default to true
+
         // Start daemon communication in background thread
         let tx_clone = tx.clone();
         std::thread::spawn(move || {
@@ -86,6 +124,10 @@ impl DictationApp {
 
             // Initialize UI state
             model_loading: false,
+
+            // Config
+            auto_copy,
+            auto_close_after_copy,
 
             rx,
             _tx: tx,
@@ -126,6 +168,11 @@ impl DictationApp {
                     self.text = self.complete_text.clone();
                     self.is_recording = false;
                     log::info!("Complete: '{}'", final_text);
+
+                    // Auto-copy if enabled
+                    if self.auto_copy {
+                        self.copy_to_clipboard();
+                    }
                 }
                 // Real-time feedback messages (audio level removed)
                 // Model management messages
@@ -190,6 +237,11 @@ impl DictationApp {
                                 .spawn();
 
                             log::info!("Successfully copied to clipboard");
+
+                            // Auto-close after copy if enabled
+                            if self.auto_close_after_copy {
+                                std::process::exit(0);
+                            }
                         }
                     }
                 }

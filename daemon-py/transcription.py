@@ -11,8 +11,9 @@ from utils import find_longest_common_overlap
 logger = logging.getLogger(__name__)
 
 class TranscriptionHandler:
-    def __init__(self, model_manager):
+    def __init__(self, model_manager, language="en"):
         self.model_manager = model_manager
+        self.language = language
         self.processing = False
         self.transcription_thread = None
         self.loop = None
@@ -82,7 +83,7 @@ class TranscriptionHandler:
                 logger.info("Starting transcription...")
                 segments, info = model.transcribe(
                     audio_chunk,
-                    language="en",
+                    language=self.language,
                     vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=200),
                     beam_size=5,

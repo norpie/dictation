@@ -17,6 +17,7 @@ from audio import AudioHandler
 from transcription import TranscriptionHandler
 from model_manager import ModelManager
 from utils import normalize_for_matching, find_longest_common_overlap
+from config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +27,18 @@ class DictationDaemon:
         self.client_writer = None
         self.transcription_complete = False
 
+        # Load configuration
+        self.config = load_config()
+
         # Model management
-        self.model_manager = ModelManager()
+        self.model_manager = ModelManager(
+            model_name=self.config.whisper.model,
+            timeout_seconds=self.config.whisper.model_timeout_seconds
+        )
 
         # Audio and transcription handlers
         self.audio_handler = AudioHandler()
-        self.transcription_handler = TranscriptionHandler(self.model_manager)
+        self.transcription_handler = TranscriptionHandler(self.model_manager, self.config.whisper.language)
 
         # Session state
         self.full_transcript = ""

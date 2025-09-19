@@ -11,9 +11,10 @@ import faster_whisper
 logger = logging.getLogger(__name__)
 
 class ModelManager:
-    def __init__(self, timeout_seconds=300):  # 5 minutes default
+    def __init__(self, model_name="distil-large-v3", timeout_seconds=300):
         self.model = None
         self.model_loaded = False
+        self.model_name = model_name
         self.timeout_seconds = timeout_seconds
         self.timeout_task = None
         self.loop = None
@@ -60,7 +61,7 @@ class ModelManager:
 
     def _load_model_sync(self):
         """Synchronous model loading (runs in executor)"""
-        self.model = faster_whisper.WhisperModel("distil-large-v3", device="cuda")
+        self.model = faster_whisper.WhisperModel(self.model_name, device="cuda")
         self.model_loaded = True
 
     def unload_model(self):
