@@ -140,6 +140,8 @@ class DictationDaemon:
         elif 'SetSensitivity' in message:
             sensitivity = message['SetSensitivity']
             await self.set_sensitivity(sensitivity)
+        elif 'ReloadConfig' in message:
+            await self.reload_config()
         elif 'Shutdown' in message:
             logger.info("Shutdown requested")
             return
@@ -258,6 +260,40 @@ class DictationDaemon:
         """Set voice activity detection sensitivity"""
         # TODO: implement in audio handler
         logger.info(f"🎚️ VAD sensitivity set to {sensitivity}")
+
+    async def reload_config(self):
+        """Reload configuration and apply changes"""
+        logger.info("🔄 Reloading configuration...")
+        try:
+            # Load new config
+            new_config = load_config()
+
+            # Check if model changed
+            old_model = self.config.whisper.model
+            new_model = new_config.whisper.model
+
+            if old_model != new_model:
+                logger.info(f"Model changed from {old_model} to {new_model}")
+                # Unload old model and update config
+                if self.model_manager.is_loaded():
+                    self.model_manager.unload_model()
+
+                # Update model manager with new model
+                self.model_manager.model_name = new_model
+                self.model_manager.timeout_seconds = new_config.whisper.model_timeout_seconds
+
+                # Update transcription handler language
+                self.transcription_handler.language = new_config.whisper.language
+
+            # Update config
+            self.config = new_config
+
+            logger.info("✅ Configuration reloaded successfully")
+            await self.send_message({'ConfigReloaded': None})
+
+        except Exception as e:
+            logger.error(f"❌ Failed to reload configuration: {e}")
+            await self.send_message({'Error': f"Failed to reload config: {e}"})
 
     async def send_message(self, message):
         """Send message to client"""

@@ -3,7 +3,15 @@ use std::fs;
 
 #[derive(Deserialize, Serialize, Default, Clone)]
 pub struct Config {
+    pub whisper: Option<WhisperConfig>,
     pub ui: Option<UIConfig>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct WhisperConfig {
+    pub model: Option<String>,
+    pub model_timeout_seconds: Option<u32>,
+    pub language: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -23,6 +31,24 @@ impl Config {
         self.ui.as_ref()
             .and_then(|ui| ui.auto_close_after_copy)
             .unwrap_or(true)
+    }
+
+    pub fn model(&self) -> String {
+        self.whisper.as_ref()
+            .and_then(|w| w.model.clone())
+            .unwrap_or_else(|| "distil-large-v3".to_string())
+    }
+
+    pub fn model_timeout_seconds(&self) -> u32 {
+        self.whisper.as_ref()
+            .and_then(|w| w.model_timeout_seconds)
+            .unwrap_or(300)
+    }
+
+    pub fn language(&self) -> String {
+        self.whisper.as_ref()
+            .and_then(|w| w.language.clone())
+            .unwrap_or_else(|| "en".to_string())
     }
 }
 

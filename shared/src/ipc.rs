@@ -10,6 +10,7 @@ pub enum ClientMessage {
     GetStatus,
     ClearSession,        // Clear any buffered/old transcriptions
     SetSensitivity(f32), // Adjust voice detection sensitivity (0.0-1.0)
+    ReloadConfig,        // Tell daemon to reload configuration
     Shutdown,
 }
 
@@ -42,6 +43,7 @@ pub enum DaemonMessage {
     Error(String),
     Status(DaemonStatus),
     SessionCleared,            // Confirm session was cleared
+    ConfigReloaded,            // Confirm configuration was reloaded
 }
 
 

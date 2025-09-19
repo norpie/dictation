@@ -31,9 +31,9 @@ fn main() -> Result<()> {
         // Launch settings window
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([400.0, 300.0])
+                .with_inner_size([500.0, 450.0])
                 .with_title("Voice Dictation Settings")
-                .with_resizable(false),
+                .with_resizable(true),
             ..Default::default()
         };
 

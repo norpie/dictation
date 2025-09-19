@@ -1,8 +1,11 @@
 use eframe::egui;
-use crate::config::{Config, load_config, save_config, UIConfig};
+use crate::config::{Config, load_config, save_config, UIConfig, WhisperConfig};
 
 pub struct SettingsApp {
     config: Config,
+    model: String,
+    timeout: f32,
+    language: String,
     auto_copy: bool,
     auto_close_after_copy: bool,
 }
@@ -10,11 +13,17 @@ pub struct SettingsApp {
 impl SettingsApp {
     pub fn new() -> Self {
         let config = load_config();
+        let model = config.model();
+        let timeout = config.model_timeout_seconds() as f32;
+        let language = config.language();
         let auto_copy = config.auto_copy();
         let auto_close_after_copy = config.auto_close_after_copy();
 
         Self {
             config,
+            model,
+            timeout,
+            language,
             auto_copy,
             auto_close_after_copy,
         }
@@ -45,8 +54,31 @@ impl eframe::App for SettingsApp {
 
             ui.add_space(20.0);
 
-            ui.checkbox(&mut self.auto_copy, "Auto-copy transcript when recording completes");
+            // Model settings
+            ui.label("Model Configuration:");
+            ui.horizontal(|ui| {
+                ui.label("Model:");
+                ui.text_edit_singleline(&mut self.model);
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Timeout (seconds):");
+                ui.add(egui::DragValue::new(&mut self.timeout).range(60.0..=3600.0));
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Language:");
+                ui.text_edit_singleline(&mut self.language);
+            });
+
             ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // UI settings
+            ui.label("UI Settings:");
+            ui.checkbox(&mut self.auto_copy, "Auto-copy transcript when recording completes");
+            ui.add_space(5.0);
 
             ui.checkbox(&mut self.auto_close_after_copy, "Auto-close window after copying");
 
@@ -58,6 +90,22 @@ impl eframe::App for SettingsApp {
                 if ui.add_sized([100.0, 35.0], egui::Button::new("Save")).clicked() {
                     // Update config and save
                     let mut new_config = self.config.clone();
+
+                    // Update whisper config
+                    if new_config.whisper.is_none() {
+                        new_config.whisper = Some(WhisperConfig {
+                            model: Some(self.model.clone()),
+                            model_timeout_seconds: Some(self.timeout as u32),
+                            language: Some(self.language.clone()),
+                        });
+                    } else {
+                        let whisper_config = new_config.whisper.as_mut().unwrap();
+                        whisper_config.model = Some(self.model.clone());
+                        whisper_config.model_timeout_seconds = Some(self.timeout as u32);
+                        whisper_config.language = Some(self.language.clone());
+                    }
+
+                    // Update UI config
                     if new_config.ui.is_none() {
                         new_config.ui = Some(UIConfig {
                             auto_copy: Some(self.auto_copy),
@@ -80,6 +128,17 @@ impl eframe::App for SettingsApp {
 
                             self.config = new_config;
                             log::info!("Settings saved successfully");
+
+                            // Tell daemon to reload config
+                            std::thread::spawn(|| {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(async {
+                                    if let Err(e) = crate::daemon_comm::send_reload_config().await {
+                                        log::error!("Failed to send reload config: {}", e);
+                                    }
+                                });
+                            });
+
                             std::process::exit(0);
                         }
                         Err(e) => {

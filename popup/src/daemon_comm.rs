@@ -109,6 +109,14 @@ pub async fn send_stop_recording() -> Result<()> {
     Ok(())
 }
 
+pub async fn send_reload_config() -> Result<()> {
+    let socket_path = "/tmp/dictation.sock";
+    let mut stream = UnixStream::connect(socket_path).await?;
+
+    protocol::send_message(&mut stream, &ClientMessage::ReloadConfig).await?;
+    Ok(())
+}
+
 async fn listen_for_daemon_messages(tx: mpsc::Sender<UiMessage>, session_id: Uuid, mut stream: UnixStream) {
     loop {
         match protocol::receive_message::<DaemonMessage>(&mut stream).await {

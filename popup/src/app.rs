@@ -83,8 +83,18 @@ impl DictationApp {
                     self.complete_text = String::new();
                 }
                 UiMessage::RecordingStopped => {
+                    log::info!("RecordingStopped received");
                     self.is_recording = false;
                     // Keep the final text for copying
+
+                    // Auto-copy if enabled and we have text
+                    if self.config.auto_copy() && !self.text.trim().is_empty() {
+                        log::info!("Auto-copy triggered on RecordingStopped");
+                        self.copy_to_clipboard();
+                    } else {
+                        log::info!("Auto-copy not triggered: auto_copy={}, text_empty={}",
+                                  self.config.auto_copy(), self.text.trim().is_empty());
+                    }
                 }
                 UiMessage::TranscriptionUpdate(new_text, is_final) => {
                     // Accumulate text chunks from daemon
@@ -95,6 +105,7 @@ impl DictationApp {
                     log::info!("Update: '{}' (final: {})", new_text, is_final);
                 }
                 UiMessage::TranscriptionComplete(final_text) => {
+                    log::info!("TranscriptionComplete received: '{}'", final_text);
                     // Add to complete text and clear current partial
                     if !self.complete_text.is_empty() && !final_text.trim().is_empty() {
                         self.complete_text.push(' ');
@@ -106,7 +117,10 @@ impl DictationApp {
 
                     // Auto-copy if enabled
                     if self.config.auto_copy() {
+                        log::info!("Auto-copy triggered on TranscriptionComplete");
                         self.copy_to_clipboard();
+                    } else {
+                        log::info!("Auto-copy not triggered on TranscriptionComplete: auto_copy={}", self.config.auto_copy());
                     }
                 }
                 // Model management messages
@@ -134,6 +148,12 @@ impl DictationApp {
         if self.is_recording {
             // Immediately update UI state
             self.is_recording = false;
+
+            // Auto-copy if enabled and we have text
+            if self.config.auto_copy() && !self.text.trim().is_empty() {
+                log::info!("Auto-copy triggered on stop recording button");
+                self.copy_to_clipboard();
+            }
 
             // Send stop message through a new thread to avoid blocking UI
             std::thread::spawn(|| {

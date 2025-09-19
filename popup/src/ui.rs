@@ -124,12 +124,36 @@ fn show_settings_window(ctx: &egui::Context, app: &mut DictationApp) {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
-            ui.set_min_width(300.0);
+            ui.set_min_width(400.0);
 
             ui.heading("Voice Dictation Settings");
             ui.separator();
 
-            // Create mutable copies for the UI
+            // Model settings
+            ui.label("Model Configuration:");
+            let mut model = app.config.model();
+            let mut timeout = app.config.model_timeout_seconds() as f32;
+            let mut language = app.config.language();
+
+            ui.horizontal(|ui| {
+                ui.label("Model:");
+                ui.text_edit_singleline(&mut model);
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Timeout (seconds):");
+                ui.add(egui::DragValue::new(&mut timeout).range(60.0..=3600.0));
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Language:");
+                ui.text_edit_singleline(&mut language);
+            });
+
+            ui.separator();
+
+            // UI settings
+            ui.label("UI Settings:");
             let mut auto_copy = app.config.auto_copy();
             let mut auto_close_after_copy = app.config.auto_close_after_copy();
 
@@ -143,6 +167,22 @@ fn show_settings_window(ctx: &egui::Context, app: &mut DictationApp) {
                 if ui.button("Save").clicked() {
                     // Update config and save
                     let mut new_config = app.config.clone();
+
+                    // Update whisper config
+                    if new_config.whisper.is_none() {
+                        new_config.whisper = Some(crate::config::WhisperConfig {
+                            model: Some(model),
+                            model_timeout_seconds: Some(timeout as u32),
+                            language: Some(language),
+                        });
+                    } else {
+                        let whisper_config = new_config.whisper.as_mut().unwrap();
+                        whisper_config.model = Some(model);
+                        whisper_config.model_timeout_seconds = Some(timeout as u32);
+                        whisper_config.language = Some(language);
+                    }
+
+                    // Update UI config
                     if new_config.ui.is_none() {
                         new_config.ui = Some(crate::config::UIConfig {
                             auto_copy: Some(auto_copy),
@@ -159,6 +199,16 @@ fn show_settings_window(ctx: &egui::Context, app: &mut DictationApp) {
                     } else {
                         app.config = new_config;
                         log::info!("Settings saved successfully");
+
+                        // Tell daemon to reload config
+                        std::thread::spawn(|| {
+                            let rt = tokio::runtime::Runtime::new().unwrap();
+                            rt.block_on(async {
+                                if let Err(e) = crate::daemon_comm::send_reload_config().await {
+                                    log::error!("Failed to send reload config: {}", e);
+                                }
+                            });
+                        });
                     }
 
                     app.show_settings = false;

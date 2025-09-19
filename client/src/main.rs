@@ -86,11 +86,14 @@ async fn main() -> Result<()> {
         DaemonMessage::Error(error) => {
             error!("Daemon error: {}", error);
         }
-        DaemonMessage::TranscriptionUpdate { session_id: _, partial_text } => {
+        DaemonMessage::TranscriptionUpdate { session_id: _, partial_text, is_final: _ } => {
             println!("Partial transcription: {}", partial_text);
         }
         DaemonMessage::TranscriptionComplete(session) => {
             println!("✓ Transcription complete: {}", session.text);
+        }
+        _ => {
+            // Ignore other message types for this simple client
         }
     }
     
@@ -107,7 +110,7 @@ async fn listen_for_transcription(stream: &mut UnixStream) -> Result<()> {
         match timeout(timeout_duration, protocol::receive_message::<DaemonMessage>(stream)).await {
             Ok(Ok(response)) => {
                 match response {
-                    DaemonMessage::TranscriptionUpdate { session_id: _, partial_text } => {
+                    DaemonMessage::TranscriptionUpdate { session_id: _, partial_text, is_final: _ } => {
                         if !partial_text.is_empty() {
                             print!("\r🔄 Partial: {}", partial_text);
                             use std::io::{self, Write};
