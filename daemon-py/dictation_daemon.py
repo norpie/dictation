@@ -20,7 +20,14 @@ import queue
 from collections import deque
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler('dictation_daemon.log')  # File output
+    ]
+)
 logger = logging.getLogger(__name__)
 
 class DictationDaemon:
@@ -37,6 +44,11 @@ class DictationDaemon:
         # Overlap handling for continuous transcription
         self.full_transcript = ""  # Complete internal transcript
         self.last_sent_length = 0  # Track what we've already sent
+
+        # Real-time feedback state
+        self.vad_sensitivity = 0.5  # Voice activity detection sensitivity (0.0-1.0)
+        self.current_audio_level = 0.0
+        self.voice_activity_detected = False
 
         # Audio parameters
         self.CHUNK = 1024
@@ -194,12 +206,58 @@ class DictationDaemon:
         except Exception as e:
             logger.error(f"Error handling client: {e}")
         finally:
-            writer.close()
-            await writer.wait_closed()
-            self.client_writer = None
+            # Comprehensive cleanup on client disconnect
+            logger.info("🔌 Client disconnecting, cleaning up...")
+
+            # Stop recording if active
             if self.recording:
+                logger.info("🛑 Stopping recording due to disconnect")
                 self.recording = False
-            logger.info("Client disconnected")
+                self.transcription_complete = True
+
+            # Clean up audio threads
+            if hasattr(self, 'audio_thread') and self.audio_thread and self.audio_thread.is_alive():
+                logger.info("🧹 Stopping audio thread")
+                # Audio thread will stop when self.recording becomes False
+                self.audio_thread.join(timeout=2.0)
+                if self.audio_thread.is_alive():
+                    logger.warning("⚠️ Audio thread did not stop gracefully")
+
+            if hasattr(self, 'transcription_thread') and self.transcription_thread and self.transcription_thread.is_alive():
+                logger.info("🧹 Stopping transcription thread")
+                # Transcription thread will stop when self.recording becomes False
+                self.transcription_thread.join(timeout=2.0)
+                if self.transcription_thread.is_alive():
+                    logger.warning("⚠️ Transcription thread did not stop gracefully")
+
+            # Clear audio queue
+            if hasattr(self, 'audio_queue'):
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                    except:
+                        break
+
+            # Reset session state
+            logger.info(f"🧹 Resetting session state on disconnect (transcript was: '{self.full_transcript[:50]}...')")
+            self.current_session_id = None
+            self.full_transcript = ""
+            self.last_sent_length = 0
+            self.voice_activity_detected = False
+            self.current_audio_level = 0.0
+
+            # Close connection safely
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, asyncio.CancelledError) as e:
+                logger.debug(f"Expected error during connection close: {e}")
+            except Exception as e:
+                logger.warning(f"Unexpected error during connection close: {e}")
+            finally:
+                self.client_writer = None
+
+            logger.info("✅ Client disconnected, cleanup complete")
 
     async def handle_message(self, message):
         """Handle incoming message from client"""
@@ -210,6 +268,11 @@ class DictationDaemon:
             await self.stop_recording()
         elif 'GetStatus' in message:
             await self.send_status()
+        elif 'ClearSession' in message:
+            await self.clear_session()
+        elif 'SetSensitivity' in message:
+            sensitivity = message['SetSensitivity']
+            await self.set_sensitivity(sensitivity)
         elif 'Shutdown' in message:
             logger.info("Shutdown requested")
             if self.recorder:
@@ -225,8 +288,21 @@ class DictationDaemon:
             self.transcription_complete = False
 
             # Reset transcript tracking for new session
+            logger.info(f"🔄 Resetting transcript for new session (was: '{self.full_transcript[:50]}...')")
             self.full_transcript = ""
             self.last_sent_length = 0
+
+            # Clear any remaining audio from previous session
+            while not self.audio_queue.empty():
+                try:
+                    self.audio_queue.get_nowait()
+                    logger.info("🧹 Cleared old audio chunk from queue")
+                except:
+                    break
+
+            # Clear the audio buffer to prevent old audio carryover
+            self.audio_buffer.clear()
+            logger.info("🧹 Cleared audio buffer from previous session")
 
             # Send recording started message (UUID as bytes)
             await self.send_message({'RecordingStarted': session_uuid.bytes})
@@ -258,7 +334,7 @@ class DictationDaemon:
                        frames_per_buffer=self.CHUNK)
 
         try:
-            while self.recording:
+            while self.recording and self.client_writer:
                 data = stream.read(self.CHUNK, exception_on_overflow=False)
                 self.audio_buffer.append(data)
                 self.chunk_counter += 1
@@ -286,15 +362,20 @@ class DictationDaemon:
             stream.stop_stream()
             stream.close()
             p.terminate()
+            logger.info("🏁 Audio capture stopped")
 
     def _transcription_worker(self):
         """Process audio chunks for transcription"""
         logger.info("Transcription worker started")
-        while self.recording or not self.audio_queue.empty():
+        while (self.recording or not self.audio_queue.empty()) and self.client_writer:
             try:
                 # Get audio chunk with timeout
                 audio_chunk = self.audio_queue.get(timeout=0.5)
                 logger.info(f"Got audio chunk for transcription, length: {len(audio_chunk)/self.RATE:.2f}s")
+
+                # Send processing started feedback
+                if self.loop and not self.loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(self.send_processing_started(), self.loop)
 
                 # Transcribe with settings optimized for continuous speech
                 logger.info("Starting transcription...")
@@ -304,7 +385,8 @@ class DictationDaemon:
                     vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=200),
                     beam_size=5,
-                    best_of=5
+                    best_of=5,
+                    word_timestamps=True  # Enable word-level timestamps
                 )
                 logger.info(f"Transcription complete, detected language: {info.language}, segments: {len(list(segments))}")
 
@@ -315,19 +397,21 @@ class DictationDaemon:
                     vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=200),
                     beam_size=5,
-                    best_of=5
+                    best_of=5,
+                    word_timestamps=True  # Enable word-level timestamps
                 )
 
-                # Combine all segments into one transcription
-                current_transcription = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+                # Process segments and collect detailed information
+                segment_list = list(segments)
+                current_transcription = " ".join(segment.text.strip() for segment in segment_list if segment.text.strip())
 
                 if current_transcription:
-                    logger.info(f"Current transcription: '{current_transcription}'")
+                    logger.info(f"Current transcription: '{current_transcription}' ({len(segment_list)} segments)")
 
-                    # Update internal transcript and get only new content
-                    new_content = self.update_transcript(current_transcription)
+                    # Use advanced overlap detection with word-level timestamps
+                    new_content = self.update_transcript_advanced(segment_list)
 
-                    # Send only new content as partial update
+                    # Send only new content as partial update (for backward compatibility)
                     if new_content and self.client_writer and not self.transcription_complete:
                         session_uuid_bytes = uuid.UUID(self.current_session_id).bytes
 
@@ -338,11 +422,15 @@ class DictationDaemon:
                                 self.send_message({
                                     'TranscriptionUpdate': {
                                         'session_id': session_uuid_bytes,
-                                        'partial_text': new_content
+                                        'partial_text': new_content,
+                                        'is_final': False  # TODO: determine if this is final segment
                                     }
                                 }),
                                 self.loop
                             )
+
+                            # Send processing complete feedback
+                            asyncio.run_coroutine_threadsafe(self.send_processing_complete(), self.loop)
                 else:
                     logger.info("No segments detected in audio chunk")
 
@@ -350,6 +438,8 @@ class DictationDaemon:
                 continue
             except Exception as e:
                 logger.error(f"Transcription error: {e}")
+
+        logger.info("🏁 Transcription worker stopped")
 
     async def stop_recording(self):
         """Stop recording"""
@@ -394,11 +484,155 @@ class DictationDaemon:
 
         await self.send_message({
             'Status': {
-                'model_loaded': True,  # RealtimeSTT handles model loading
+                'model_loaded': True,
                 'active_sessions': active_sessions,
-                'uptime': {'secs': 0, 'nanos': 0}  # TODO: track uptime
+                'uptime': {'secs': 0, 'nanos': 0},  # TODO: track uptime
+                'audio_device': "default",  # TODO: get actual device name
+                'buffer_size': self.CHUNK,
+                'vad_sensitivity': self.vad_sensitivity
             }
         })
+
+    async def clear_session(self):
+        """Clear the current session and transcript"""
+        logger.info("🧹 Clearing session")
+        self.full_transcript = ""
+        self.last_sent_length = 0
+
+        # Send confirmation
+        await self.send_message({'SessionCleared': None})
+
+    async def set_sensitivity(self, sensitivity):
+        """Set voice activity detection sensitivity"""
+        self.vad_sensitivity = max(0.0, min(1.0, sensitivity))  # Clamp to 0.0-1.0
+        logger.info(f"🎚️ VAD sensitivity set to {self.vad_sensitivity}")
+
+    async def send_audio_level(self, level):
+        """Send current audio level to client"""
+        self.current_audio_level = level
+        if self.client_writer and not self.transcription_complete:
+            await self.send_message({'AudioLevel': level})
+
+    async def send_voice_activity_detected(self):
+        """Send voice activity detected message"""
+        if not self.voice_activity_detected:
+            self.voice_activity_detected = True
+            logger.info("🎤 Voice activity detected")
+            if self.client_writer and not self.transcription_complete:
+                await self.send_message({'VoiceActivityDetected': None})
+
+    async def send_voice_activity_ended(self):
+        """Send voice activity ended message"""
+        if self.voice_activity_detected:
+            self.voice_activity_detected = False
+            logger.info("🔇 Voice activity ended")
+            if self.client_writer and not self.transcription_complete:
+                await self.send_message({'VoiceActivityEnded': None})
+
+    async def send_processing_started(self):
+        """Send processing started message"""
+        logger.info("⚙️ Processing started")
+        if self.client_writer and not self.transcription_complete:
+            await self.send_message({'ProcessingStarted': None})
+
+    async def send_processing_complete(self):
+        """Send processing complete message"""
+        logger.info("✅ Processing complete")
+        if self.client_writer and not self.transcription_complete:
+            await self.send_message({'ProcessingComplete': None})
+
+    def update_transcript_advanced(self, segments):
+        """Advanced transcript update using word-level timestamps and probabilities"""
+        if not segments:
+            return ""
+
+        # Extract all words with timestamps from current segments
+        current_words = []
+        for segment in segments:
+            if hasattr(segment, 'words') and segment.words:
+                for word in segment.words:
+                    current_words.append({
+                        'word': word.word.strip(),
+                        'start': word.start,
+                        'end': word.end,
+                        'probability': word.probability,
+                        'segment_text': segment.text.strip()
+                    })
+            else:
+                # Fallback if no word-level data
+                words_in_segment = segment.text.strip().split()
+                for i, word in enumerate(words_in_segment):
+                    current_words.append({
+                        'word': word,
+                        'start': segment.start + (i * (segment.end - segment.start) / len(words_in_segment)),
+                        'end': segment.start + ((i + 1) * (segment.end - segment.start) / len(words_in_segment)),
+                        'probability': 1.0,  # Unknown, assume high
+                        'segment_text': segment.text.strip()
+                    })
+
+        if not current_words:
+            return ""
+
+        # If this is the first transcription, use it all
+        if not self.full_transcript:
+            new_text = " ".join(word['word'] for word in current_words)
+            self.full_transcript = new_text
+            logger.info(f"🆕 First transcription: '{new_text}'")
+            return new_text
+
+        # Find overlap with existing transcript using word matching
+        existing_words = self.full_transcript.split()
+
+        # Look for best overlap by comparing word sequences
+        best_overlap = 0
+        best_new_start = 0
+
+        # Try different starting points in current words
+        for start_idx in range(len(current_words)):
+            current_sequence = [w['word'] for w in current_words[start_idx:]]
+
+            # Find longest match with end of existing transcript
+            max_overlap_len = min(len(existing_words), len(current_sequence))
+
+            for overlap_len in range(max_overlap_len, 0, -1):
+                existing_suffix = existing_words[-overlap_len:]
+                current_prefix = current_sequence[:overlap_len]
+
+                # Fuzzy match allowing for minor differences
+                if self.sequences_match(existing_suffix, current_prefix):
+                    if overlap_len > best_overlap:
+                        best_overlap = overlap_len
+                        best_new_start = start_idx + overlap_len
+                    break
+
+        # Extract only truly new content
+        if best_new_start < len(current_words):
+            new_words = current_words[best_new_start:]
+            new_content = " ".join(word['word'] for word in new_words)
+
+            if new_content.strip():
+                self.full_transcript += " " + new_content
+                logger.info(f"🔄 Added new content: '{new_content}' (overlap: {best_overlap} words)")
+                return new_content
+
+        logger.info(f"🔄 No new content found (overlap: {best_overlap} words)")
+        return ""
+
+    def sequences_match(self, seq1, seq2, threshold=0.8):
+        """Check if two word sequences match with fuzzy matching"""
+        if len(seq1) != len(seq2):
+            return False
+
+        matches = 0
+        for w1, w2 in zip(seq1, seq2):
+            # Exact match or very similar (handle punctuation differences)
+            w1_clean = w1.lower().strip('.,!?;:"\'')
+            w2_clean = w2.lower().strip('.,!?;:"\'')
+
+            if w1_clean == w2_clean or abs(len(w1_clean) - len(w2_clean)) <= 1:
+                matches += 1
+
+        return (matches / len(seq1)) >= threshold
 
     async def send_message(self, message):
         """Send message to client"""
@@ -412,8 +646,12 @@ class DictationDaemon:
             self.client_writer.write(length + data)
             await self.client_writer.drain()
 
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug(f"Connection lost: {e}")
+            return "Connection lost"
         except Exception as e:
             logger.error(f"Error sending message: {e}")
+            return str(e)
 
 async def main():
     daemon = DictationDaemon()

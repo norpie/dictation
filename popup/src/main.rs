@@ -21,7 +21,7 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 300.0])
+            .with_inner_size([600.0, 400.0])
             .with_title("Voice Dictation"),
         ..Default::default()
     };
@@ -40,6 +40,12 @@ struct DictationApp {
     daemon_connected: bool,
     is_recording: bool,
     session_id: Option<Uuid>,
+
+    // Real-time feedback state
+    audio_level: f32,
+    voice_active: bool,
+    is_processing: bool,
+
     rx: mpsc::Receiver<UiMessage>,
     _tx: mpsc::Sender<UiMessage>, // Keep sender alive
 }
@@ -49,8 +55,18 @@ enum UiMessage {
     DaemonConnected(bool),
     RecordingStarted(Uuid),
     RecordingStopped,
-    TranscriptionUpdate(String),
+    TranscriptionUpdate(String, bool), // text, is_final
     TranscriptionComplete(String),
+
+    // Real-time feedback
+    AudioLevel(f32),
+    VoiceActivityDetected,
+    VoiceActivityEnded,
+    ProcessingStarted,
+    ProcessingComplete,
+
+    // Session management
+    SessionCleared,
     Error(String),
 }
 
@@ -71,6 +87,12 @@ impl DictationApp {
             daemon_connected: false,
             is_recording: false,
             session_id: None,
+
+            // Initialize feedback state
+            audio_level: 0.0,
+            voice_active: false,
+            is_processing: false,
+
             rx,
             _tx: tx,
         }
@@ -101,14 +123,13 @@ impl DictationApp {
                     self.recording_status = "Recording stopped".to_string();
                     // Keep the final text for copying
                 }
-                UiMessage::TranscriptionUpdate(new_content) => {
-                    // Daemon sends incremental new content, accumulate it
-                    if !self.complete_text.is_empty() && !new_content.trim().is_empty() {
-                        self.complete_text.push(' ');
+                UiMessage::TranscriptionUpdate(new_text, is_final) => {
+                    // Accumulate text chunks from daemon
+                    if !self.text.is_empty() && !new_text.trim().is_empty() {
+                        self.text.push(' ');
                     }
-                    self.complete_text.push_str(&new_content);
-                    self.text = self.complete_text.clone();
-                    log::info!("Added: '{}' -> Full: '{}'", new_content, self.text);
+                    self.text.push_str(&new_text);
+                    log::info!("Update: '{}' (final: {})", new_text, is_final);
                 }
                 UiMessage::TranscriptionComplete(final_text) => {
                     // Add to complete text and clear current partial
@@ -120,6 +141,39 @@ impl DictationApp {
                     self.is_recording = false;
                     self.recording_status = "Recording complete".to_string();
                     log::info!("Complete: '{}'", final_text);
+                }
+                // Real-time feedback messages
+                UiMessage::AudioLevel(level) => {
+                    self.audio_level = level;
+                }
+                UiMessage::VoiceActivityDetected => {
+                    self.voice_active = true;
+                    if self.is_recording {
+                        self.recording_status = "🎤 Voice detected...".to_string();
+                    }
+                }
+                UiMessage::VoiceActivityEnded => {
+                    self.voice_active = false;
+                    if self.is_recording {
+                        self.recording_status = "🔴 Recording...".to_string();
+                    }
+                }
+                UiMessage::ProcessingStarted => {
+                    self.is_processing = true;
+                    if self.is_recording {
+                        self.recording_status = "⚙️ Processing...".to_string();
+                    }
+                }
+                UiMessage::ProcessingComplete => {
+                    self.is_processing = false;
+                    if self.is_recording {
+                        self.recording_status = "🔴 Recording...".to_string();
+                    }
+                }
+                UiMessage::SessionCleared => {
+                    self.complete_text.clear();
+                    self.text.clear();
+                    self.recording_status = "Session cleared".to_string();
                 }
                 UiMessage::Error(error) => {
                     self.recording_status = format!("Error: {}", error);
@@ -144,33 +198,35 @@ impl DictationApp {
         }
     }
 
+
     fn copy_to_clipboard(&mut self) {
         if !self.text.trim().is_empty() {
             use std::io::Write;
+
+            // Spawn wl-copy and let it run in background (required for Wayland)
             match std::process::Command::new("wl-copy")
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn() {
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
                 Ok(mut child) => {
-                    if let Some(stdin) = child.stdin.take() {
-                        let mut stdin = stdin;
+                    if let Some(mut stdin) = child.stdin.take() {
                         if stdin.write_all(self.text.as_bytes()).is_ok() {
-                            drop(stdin);
-                            if child.wait().map(|s| s.success()).unwrap_or(false) {
-                                self.recording_status = "📋 Copied to clipboard!".to_string();
-                            } else {
-                                self.recording_status = "Copy failed".to_string();
-                            }
+                            drop(stdin); // Close stdin
+                            // Don't wait for child - let wl-copy run in background
+                            self.recording_status = "📋 Copied to clipboard!".to_string();
+                            log::info!("Successfully copied to clipboard");
                         } else {
-                            self.recording_status = "Copy failed".to_string();
+                            self.recording_status = "Copy failed: couldn't write to wl-copy".to_string();
                         }
                     } else {
-                        self.recording_status = "Copy failed".to_string();
+                        self.recording_status = "Copy failed: couldn't get stdin".to_string();
                     }
                 }
                 Err(e) => {
                     self.recording_status = format!("Copy failed: {}", e);
-                    log::error!("Failed to copy with wl-copy: {}", e);
+                    log::error!("Failed to spawn wl-copy: {}", e);
                 }
             }
         } else {
@@ -188,22 +244,71 @@ impl eframe::App for DictationApp {
         ctx.request_repaint();
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Set larger font sizes
+            let mut style = (*ctx.style()).clone();
+            style.text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::new(16.0, egui::FontFamily::Proportional),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::new(16.0, egui::FontFamily::Proportional),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::new(20.0, egui::FontFamily::Proportional),
+            );
+            ctx.set_style(style);
+
             ui.heading("Voice Dictation");
 
             // Status line with daemon connection indicator
             ui.horizontal(|ui| {
-                let color = if self.daemon_connected {
+                // Daemon connection status
+                let daemon_color = if self.daemon_connected {
                     egui::Color32::GREEN
                 } else {
                     egui::Color32::RED
                 };
-                ui.colored_label(color, "●");
+                ui.colored_label(daemon_color, "●");
                 ui.label(if self.daemon_connected {
-                    "Connected to daemon"
+                    "Connected"
                 } else {
-                    "Daemon not available"
+                    "Disconnected"
                 });
+
+                ui.separator();
+
+                // Voice activity indicator
+                if self.is_recording {
+                    let voice_color = if self.voice_active {
+                        egui::Color32::from_rgb(255, 165, 0) // Orange
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    ui.colored_label(voice_color, "🎤");
+                    ui.label(if self.voice_active { "Voice" } else { "Silent" });
+
+                    ui.separator();
+
+                    // Processing indicator
+                    if self.is_processing {
+                        ui.colored_label(egui::Color32::BLUE, "⚙️");
+                        ui.label("Processing");
+                    }
+                }
             });
+
+            // Audio level meter (only show when recording)
+            if self.is_recording {
+                ui.horizontal(|ui| {
+                    ui.label("Audio Level:");
+                    let progress = egui::ProgressBar::new(self.audio_level)
+                        .desired_width(100.0)
+                        .show_percentage();
+                    ui.add(progress);
+                });
+            }
 
             ui.separator();
 
@@ -218,14 +323,24 @@ impl eframe::App for DictationApp {
             // Text area
             ui.label("Transcription:");
             egui::ScrollArea::vertical()
-                .max_height(150.0)
+                .max_height(200.0)
                 .show(ui, |ui| {
-                    ui.add_sized(
-                        [ui.available_width(), ui.available_height()],
-                        egui::TextEdit::multiline(&mut self.text)
-                            .font(egui::TextStyle::Body)
-                            .interactive(!self.is_recording)
-                    );
+                    if self.is_recording {
+                        // Read-only display during recording to prevent flashing
+                        ui.add_sized(
+                            [ui.available_width(), ui.available_height()],
+                            egui::TextEdit::multiline(&mut self.text.clone())
+                                .font(egui::TextStyle::Body)
+                                .interactive(false)
+                        );
+                    } else {
+                        // Editable after recording
+                        ui.add_sized(
+                            [ui.available_width(), ui.available_height()],
+                            egui::TextEdit::multiline(&mut self.text)
+                                .font(egui::TextStyle::Body)
+                        );
+                    }
                 });
 
             ui.separator();
@@ -234,24 +349,23 @@ impl eframe::App for DictationApp {
             // Buttons
             ui.horizontal(|ui| {
                 if self.is_recording {
-                    if ui.button("⏹ Stop Recording").clicked() {
+                    if ui.add_sized([120.0, 40.0], egui::Button::new("⏹ Stop Recording")).clicked() {
                         self.stop_recording();
                     }
                 } else {
-                    if ui.button("📋 Copy").clicked() {
+                    if ui.add_sized([100.0, 40.0], egui::Button::new("📋 Copy")).clicked() {
                         self.copy_to_clipboard();
                     }
 
-                    if ui.button("🗑 Discard").clicked() {
+                    if ui.add_sized([100.0, 40.0], egui::Button::new("🗑 Discard")).clicked() {
                         std::process::exit(0);
                     }
                 }
             });
 
             // Keyboard shortcuts
-            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !self.is_recording {
                 self.copy_to_clipboard();
-                std::process::exit(0);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 std::process::exit(0);
@@ -330,14 +444,15 @@ async fn send_stop_recording() -> Result<()> {
     Ok(())
 }
 
+
 async fn listen_for_daemon_messages(tx: mpsc::Sender<UiMessage>, session_id: Uuid, mut stream: UnixStream) {
     loop {
         match protocol::receive_message::<DaemonMessage>(&mut stream).await {
             Ok(message) => {
                 match message {
-                    DaemonMessage::TranscriptionUpdate { session_id: msg_session_id, partial_text } => {
+                    DaemonMessage::TranscriptionUpdate { session_id: msg_session_id, partial_text, is_final } => {
                         if msg_session_id == session_id {
-                            let _ = tx.send(UiMessage::TranscriptionUpdate(partial_text));
+                            let _ = tx.send(UiMessage::TranscriptionUpdate(partial_text, is_final));
                         }
                     }
                     DaemonMessage::TranscriptionComplete(session) => {
@@ -348,6 +463,25 @@ async fn listen_for_daemon_messages(tx: mpsc::Sender<UiMessage>, session_id: Uui
                     DaemonMessage::RecordingStopped => {
                         let _ = tx.send(UiMessage::RecordingStopped);
                         return; // Exit listen loop
+                    }
+                    // Real-time feedback messages
+                    DaemonMessage::AudioLevel(level) => {
+                        let _ = tx.send(UiMessage::AudioLevel(level));
+                    }
+                    DaemonMessage::VoiceActivityDetected => {
+                        let _ = tx.send(UiMessage::VoiceActivityDetected);
+                    }
+                    DaemonMessage::VoiceActivityEnded => {
+                        let _ = tx.send(UiMessage::VoiceActivityEnded);
+                    }
+                    DaemonMessage::ProcessingStarted => {
+                        let _ = tx.send(UiMessage::ProcessingStarted);
+                    }
+                    DaemonMessage::ProcessingComplete => {
+                        let _ = tx.send(UiMessage::ProcessingComplete);
+                    }
+                    DaemonMessage::SessionCleared => {
+                        let _ = tx.send(UiMessage::SessionCleared);
                     }
                     DaemonMessage::Error(error) => {
                         let _ = tx.send(UiMessage::Error(error));

@@ -6,3 +6,4 @@ CLAUDE.md
 /models/*.ggml
 RealtimeSTT/
 daemon.log
+daemon-py/dictation_daemon.log

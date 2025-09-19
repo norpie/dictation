@@ -8,6 +8,8 @@ pub enum ClientMessage {
     StopRecording,
     StreamAudio(AudioChunk),
     GetStatus,
+    ClearSession,        // Clear any buffered/old transcriptions
+    SetSensitivity(f32), // Adjust voice detection sensitivity (0.0-1.0)
     Shutdown,
 }
 
@@ -15,20 +17,37 @@ pub enum ClientMessage {
 pub enum DaemonMessage {
     RecordingStarted(Uuid),
     RecordingStopped,
-    TranscriptionUpdate { 
-        session_id: Uuid, 
-        partial_text: String 
+
+    // Enhanced transcription messages
+    TranscriptionUpdate {
+        session_id: Uuid,
+        partial_text: String,
+        is_final: bool,  // Is this segment final?
     },
     TranscriptionComplete(TranscriptionSession),
+
+    // Real-time feedback
+    AudioLevel(f32),           // Current audio level (0.0-1.0)
+    VoiceActivityDetected,     // Voice detected, processing will start
+    VoiceActivityEnded,        // Voice stopped, finishing segment
+    ProcessingStarted,         // Started transcribing audio chunk
+    ProcessingComplete,        // Finished transcribing chunk
+
+    // Status and session management
     Error(String),
     Status(DaemonStatus),
+    SessionCleared,            // Confirm session was cleared
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub model_loaded: bool,
     pub active_sessions: Vec<Uuid>,
     pub uptime: std::time::Duration,
+    pub audio_device: String,      // Current audio device name
+    pub buffer_size: usize,        // Current audio buffer size
+    pub vad_sensitivity: f32,      // Voice detection sensitivity (0.0-1.0)
 }
 
 pub mod protocol {
