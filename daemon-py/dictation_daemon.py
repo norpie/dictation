@@ -55,7 +55,7 @@ class DictationDaemon:
         # Initialize faster-whisper model directly
         logger.info("Initializing faster-whisper model...")
         try:
-            self.model = faster_whisper.WhisperModel("large-v3", device="cuda")
+            self.model = faster_whisper.WhisperModel("distil-large-v3", device="cuda")
             logger.info("✅ faster-whisper model initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize faster-whisper model: {e}")

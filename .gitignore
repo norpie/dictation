@@ -4,3 +4,5 @@ CLAUDE.md
 /target
 /models/*.bin
 /models/*.ggml
+RealtimeSTT/
+daemon.log

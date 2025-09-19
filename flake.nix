@@ -32,6 +32,18 @@
             dbus
             systemd
             whisper-cpp
+            # Wayland libraries for egui
+            wayland
+            wayland-protocols
+            libxkbcommon
+            # X11 fallback libraries
+            xorg.libX11
+            xorg.libXcursor
+            xorg.libXrandr
+            xorg.libXi
+            # OpenGL for egui
+            libGL
+            # ROCm libraries
             rocmPackages.clr
             rocmPackages.rocblas
             rocmPackages.hipblas
@@ -77,6 +89,18 @@
               # UI libraries
               gtk4
               libadwaita
+              # Wayland libraries for egui
+              wayland
+              wayland-protocols
+              libxkbcommon
+              # X11 fallback libraries
+              xorg.libX11
+              xorg.libXcursor
+              xorg.libXrandr
+              xorg.libXi
+              # OpenGL for egui
+              libGL
+              mesa
 
               # System libraries
               dbus
